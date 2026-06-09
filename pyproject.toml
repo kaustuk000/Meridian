@@ -1,0 +1,30 @@
+[project]
+name = "meridian"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "geoopt",
+    "img2dataset>=1.47.0",
+    "loguru>=0.7.3",
+    "matplotlib>=3.10.9",
+    "open-clip-torch>=3.3.0",
+    "scikit-learn>=1.9.0",
+    "setuptools>=82.0.1",
+    "tensorboard>=2.20.0",
+    "torch>=2.10.0",
+    "torchcodec>=0.14.0",
+    "torchvision>=0.25.0",
+    "transformers>=5.10.2",
+]
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+torchaudio = { index = "pytorch-cu130" }
+geoopt = { git = "https://github.com/geoopt/geoopt.git" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
