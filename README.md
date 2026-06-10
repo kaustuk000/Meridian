@@ -29,11 +29,13 @@ Hyperbolic geometry resolves this by introducing an implicit hierarchical gradie
 * **The Origin (Center):** General, overarching parent concepts (e.g., *Entity*, *Vehicle*, *Animal*) naturally gravitate toward the center of the disk.
 * **The Boundary (Edge):** Highly specific leaf-nodes (e.g., *Supersonic jet airplane*, *German shepherd puppy*) branch outwards along continuous paths toward the perimeter.
 
-The geodesic distance between two points u and v within the Lorentz manifold is mathematically enforced via:
+The geodesic distance between two points on the Lorentz manifold is defined as:
 
-```
-$d_{\mathbb{B}}(u, v)=\operatorname{arcosh}\!\left(1+\frac{2\lVert u-v\rVert^2}{(1-\lVert u\rVert^2)(1-\lVert v\rVert^2)}\right)$
-```
+`d_L(x, y) = (1/√c) arcosh(-c ⟨x, y⟩_L)`
+
+where the Lorentzian inner product is:
+
+`⟨x, y⟩_L = -x₀y₀ + Σᵢ xᵢyᵢ`
 
 As embeddings approach the boundary (||u||, ||v|| → 1), the denominator shrinks, causing the distance to grow exponentially—giving the model infinite room to isolate dense clusters cleanly.
 
@@ -103,21 +105,38 @@ Or programmatically:
 
 ```python
 import torch
+
 from meridian.model import MeridianModel
 from meridian.tokenizer import Tokenizer
 
-# Load model
-model = MeridianModel.from_pretrained("meridian/checkpoints/meridian_v1")
+# Initialize model
+model = MeridianModel()
 model.eval()
 
-# Dummy inputs for Presentation
-image = torch.randn(1, 3, 224, 224)
-text_ids = torch.tensor([[1, 2, 3, ...]])
+# Example inputs
+pixel_values = torch.randn(1, 3, 224, 224)
 
-# Get embeddings
+tokenizer = Tokenizer()
+tokens = tokenizer(["A photo of a golden retriever"])
+
 with torch.no_grad():
-    image_emb = model.encode_image(image)
-    text_emb = model.encode_text(text_ids)
+    outputs = model(
+        pixel_values=pixel_values,
+        input_ids=tokens["input_ids"],
+        attention_mask=tokens["attention_mask"],
+        eos_indices=tokens["eos_indices"],
+    )
+
+# Hyperbolic embeddings
+h_image = outputs["h_image"]
+h_text = outputs["h_text"]
+
+# Euclidean embeddings
+e_image = outputs["e_image"]
+e_text = outputs["e_text"]
+
+print("Hyperbolic Image Embedding Shape:", h_image.shape)
+print("Hyperbolic Text Embedding Shape:", h_text.shape)
 ```
 
 ### Evaluation
@@ -251,7 +270,7 @@ If you use Meridian in your research, please use the following BibTeX entry:
   title        = {Meridian: Hyperbolic Image--Text Representations},
   author       = {Kaustuk Pratap Singh},
   year         = {2026},
-  howpublished = {\url{https://github.com/<your-username>/Meridian}},
+  howpublished = {\url{https://github.com/<kaustuk000>/Meridian}},
   note         = {Open-source research project}
 }
 ```
