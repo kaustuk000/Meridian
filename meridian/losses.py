@@ -81,6 +81,8 @@ class MeridianLoss(nn.Module):
         _aperture = half_aperture_angle(h_text, curv)
         entailment_loss = torch.clamp(_angle - _aperture, min=0.0).mean()
 
+        
+
         # 3. Gather ALL features globally for cross-GPU contrastive pools
         all_h_image = gather_features(h_image)
         all_h_text = gather_features(h_text)
@@ -132,10 +134,12 @@ class MeridianLoss(nn.Module):
         total_loss = (
             self.gate_weight * gate_contrastive_loss +
             hyp_contrastive_loss + 
-            entailment_loss * entail_weight +
             self.eucl_weight * eucl_contrastive_loss
         )
 
+        if entail_weight > 0.0:
+            total_loss = total_loss + entailment_loss * entail_weight
+            
         return total_loss, {
             "loss/total": total_loss.item(),
             "loss/gate_combined": gate_contrastive_loss.item(),

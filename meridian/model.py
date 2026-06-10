@@ -99,7 +99,7 @@ class HyperbolicImageHead(nn.Module):
         v = self.image_mlp(cls_token)
 
         with torch.autocast(device_type=v.device.type, dtype=torch.float32):
-            alpha = self.log_alpha_img.exp()
+            alpha = torch.clamp(self.log_alpha_img, max = 0.0).exp()
             v = alpha * v
             h_image = exp_map0(v, curv = curv) # Map to hyperbolic space using expmap0
         return h_image
@@ -115,7 +115,7 @@ class HyperbolicTextHead(nn.Module):
             -> expmap0
     """
 
-    def __init__(self, input_dim: int = 512, out_dim: int = 16, adapter_layers: int = 1):
+    def __init__(self, input_dim: int = 512, out_dim: int = 16, adapter_layers: int = 2):
         super().__init__()
         self.text_adapter = TransformerAdapter(input_dim, num_layers = adapter_layers)
         self.text_mlp = nn.Sequential(
@@ -146,7 +146,7 @@ class HyperbolicTextHead(nn.Module):
         v = self.text_mlp(eos_token)
 
         with torch.autocast(device_type=v.device.type, dtype=torch.float32):
-            alpha = self.log_alpha_txt.exp()
+            alpha = torch.clamp(self.log_alpha_txt, max = 0.0).exp()
             v = alpha * v
             h_text = exp_map0(v, curv = curv) # Map to hyperbolic space using expmap0
         return h_text
@@ -175,12 +175,12 @@ class EuclideanImageHead(nn.Module):
         v = self.image_mlp(cls_token)
 
         with torch.autocast(device_type=v.device.type, dtype=torch.float32):
-            alpha = self.log_alpha_img.exp()
+            alpha = torch.clamp(self.log_alpha_img, max = 0.0).exp()
             e_image = alpha * v
         return e_image
 
 class EuclideanTextHead(nn.Module):
-    def __init__(self, input_dim: int = 512, out_dim: int = 16, adapter_layers: int = 1):
+    def __init__(self, input_dim: int = 512, out_dim: int = 16, adapter_layers: int = 2):
         super().__init__()
         self.text_adapter = TransformerAdapter(input_dim, num_layers = adapter_layers)
         self.text_mlp = nn.Sequential(
@@ -211,7 +211,7 @@ class EuclideanTextHead(nn.Module):
         v = self.text_mlp(eos_token)
 
         with torch.autocast(device_type=v.device.type, dtype=torch.float32):
-            alpha = self.log_alpha_txt.exp()
+            alpha = torch.clamp(self.log_alpha_txt, max = 0.0).exp()
             e_text = alpha * v
         return e_text
 
@@ -269,14 +269,15 @@ class MeridianModel(nn.Module):
             self.register_buffer('curv', torch.tensor(curv_init))  # Fixed curvature
 
         self._curv_minmax = {
-            "max": math.log(curv_init * 10),
-            "min": math.log(curv_init / 10),
+            "max": math.log(curv_init * 10),  
+            "min": math.log(curv_init / 10), 
         }
-
+        
         # Temperature for Contrastive Loss
-        self.logit_scale_hyp = nn.Parameter(torch.tensor(1.0/0.07).log())
-        self.logit_scale_eucl = nn.Parameter(torch.tensor(1.0/0.07).log())
-
+        self.logit_scale_hyp  = nn.Parameter(torch.tensor(1.0 / 0.07).log())  # log(1/0.07), CLIP standard
+        self.logit_scale_eucl = nn.Parameter(torch.tensor(1.0 / 0.07).log())
+        
+   
         # Make entailment weight learnable or fixed
         if learn_entail:
             self.entail_weight = nn.Parameter(torch.tensor(entail_init))
@@ -300,10 +301,11 @@ class MeridianModel(nn.Module):
 
         self.eucl_image_head = EuclideanImageHead(input_dim = 768, out_dim = image_eout)
         self.eucl_text_head = EuclideanTextHead(input_dim = 512, out_dim = text_eout)
-
+        
         # Initialize the PerModalityGate
         self.gate_image = PerModalityGate(hyp_dim = image_hout, eucl_dim = image_eout, clip_dim = 768)
         self.gate_text  = PerModalityGate(hyp_dim = text_hout, eucl_dim = text_eout, clip_dim = 512)
+
 
     def train(self, mode: bool = True):
         """Ensure CLIP stays frozen in eval mode even when .train() is called."""
@@ -322,15 +324,13 @@ class MeridianModel(nn.Module):
 
         device_type = pixel_values.device.type
 
-        # Clamp all scalars before use — every forward pass
+        # Clamp curvature before use — needed for hyperbolic operation safety
         clamped_curv_log = torch.clamp(self.curv, min=self._curv_minmax["min"], max=self._curv_minmax["max"])
         _curv = clamped_curv_log.exp()
         
-        clamped_scale_hyp = torch.clamp(self.logit_scale_hyp, max=4.6052)
-        hyp_temp = clamped_scale_hyp.exp()
-
-        clamped_scale_eucl = torch.clamp(self.logit_scale_eucl, max=4.6052)
-        eucl_temp = clamped_scale_eucl.exp()
+        # Temperature scales are protected by gradient clipping hooks — no forward clamping needed
+        hyp_temp = torch.clamp(self.logit_scale_hyp, max = 4.6052).exp()
+        eucl_temp = torch.clamp(self.logit_scale_eucl, max = 4.6052).exp()
 
         # Clamp Hyperbolic Alphas
         img_h_alpha = torch.clamp(self.hyp_image_head.log_alpha_img, max=0.0).exp()
@@ -339,10 +339,12 @@ class MeridianModel(nn.Module):
         img_e_alpha = torch.clamp(self.eucl_image_head.log_alpha_img, max=0.0).exp()
         txt_e_alpha = torch.clamp(self.eucl_text_head.log_alpha_txt, max=0.0).exp()
 
-        if isinstance(self.entail_weight, nn.Parameter):
-            _active_entail_weight = torch.clamp(self.entail_weight, min=0.0, max=5.0)
-        else:
-            _active_entail_weight = self.entail_weight
+        #if isinstance(self.entail_weight, nn.Parameter):
+        #    _active_entail_weight = self.entail_weight
+        #else:
+        #    _active_entail_weight = self.entail_weight
+
+        _active_entail_weight = self.entail_weight
 
         # Extract Hidden States from the CLIP Model
         with torch.no_grad():

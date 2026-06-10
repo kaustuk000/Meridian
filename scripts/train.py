@@ -5,6 +5,7 @@ Meridian training script.
 import argparse
 import time
 import random
+import pickle
 from pathlib import Path
 
 import torch
@@ -54,6 +55,13 @@ class MeridianCheckpointManager:
         self.scaler = scaler
 
     def save(self, iteration: int, is_final: bool = False):
+        # VALIDATION: Check for NaN in model parameters before saving
+        for name, param in self.model.named_parameters():
+            if torch.isnan(param).any():
+                logger.error(f"CHECKPOINT VALIDATION FAILED: Parameter '{name}' contains NaN values!")
+                logger.error(f"Skipping checkpoint save to prevent corruption at iteration {iteration}")
+                return False
+        
         filename = "checkpoint_final.pt" if is_final else f"checkpoint_{iteration:07d}.pt"
         ckpt_path = self.output_dir / filename
 
@@ -71,6 +79,8 @@ class MeridianCheckpointManager:
         latest_path = self.output_dir / "latest_checkpoint.txt"
         with open(latest_path, "w") as f:
             f.write(str(filename))
+        
+        return True
 
     def resume(self) -> int:
         latest_path = self.output_dir / "latest_checkpoint.txt"
@@ -88,6 +98,14 @@ class MeridianCheckpointManager:
 
         logger.info(f"Resuming training state from checkpoint: {ckpt_path}")
         checkpoint = torch.load(ckpt_path, map_location="cpu") # Load all tensors onto the CPU
+        
+        # VALIDATION: Check for NaN in loaded checkpoint
+        model_state = checkpoint["model_state_dict"]
+        for param_name, param_tensor in model_state.items():
+            if torch.isnan(param_tensor).any():
+                logger.error(f"CHECKPOINT VALIDATION FAILED: Loaded checkpoint contains NaN in '{param_name}'")
+                logger.error(f"Checkpoint {ckpt_path} is corrupted. Starting fresh from iteration 0.")
+                return 0
 
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -128,14 +146,17 @@ parser.add_argument("--warmup-steps", type = int, default = 5000, help = "Linear
 parser.add_argument("--lr", type = float, default = 5e-4, help = "Peak learning rate.")
 parser.add_argument("--weight-decay", type = float, default = 0.2, help = "AdamW weight decay configuration.")
 parser.add_argument("--batch-size", type = int, default = 64, help = "Training batch size.")
-parser.add_argument("--amp", action = "store_true", default = True, help = "Enable automatic mixed precision training.")
+parser.add_argument("--amp", action = "store_true", help = "Enable automatic mixed precision training.") 
 parser.add_argument("--workers", type = int, default = 6, help = "Dataloader worker threads.")
 
 # Architecture Specific Params
 parser.add_argument("--image-hout", type = int, default = 16, help = "Hyperbolic out dimension for image.")
-parser.add_argument("--image-eout", type = int, default = 32, help = "Euclidean out dimension for image.")
+parser.add_argument("--image-eout", type = int, default = 16, help = "Euclidean out dimension for image.")
 parser.add_argument("--text-hout", type = int, default = 16, help = "Hyperbolic out dimension for text.")
-parser.add_argument("--text-eout", type = int, default = 32, help = "Euclidean out dimension for text.")
+parser.add_argument("--text-eout", type = int, default = 16, help = "Euclidean out dimension for text.")
+
+paraser = paraser.add_argument("--eucl_weight", type = float, default = 1.0, help = "Euclidean contrastive loss weight.")
+parser.add_argument("--gate_weight", type = float, default = 1.0, help = "Gated fusion loss weight.")
 
 def main(_A: argparse.Namespace):
     # Environment and Logging Setup
@@ -143,7 +164,7 @@ def main(_A: argparse.Namespace):
     np.random.seed(_A.seed)
     torch.manual_seed(_A.seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = False
 
     output_dir = Path(_A.output_dir)
     output_dir.mkdir(parents = True, exist_ok = True)
@@ -162,7 +183,7 @@ def main(_A: argparse.Namespace):
         text_hout = _A.text_hout, text_eout = _A.text_eout
     ).to(device)
 
-    criterion = MeridianLoss(eucl_weight = 1.0, gate_weight = 1.0).to(device)
+    criterion = MeridianLoss(eucl_weight = _A.eucl_weight, gate_weight = _A.gate_weight).to(device)
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -179,7 +200,7 @@ def main(_A: argparse.Namespace):
 
     optimizer = torch.optim.AdamW(param_groups, lr = _A.lr, betas = (0.9, 0.98), eps = 1e-6)
     schedular = LinearWarmupCosineDecayLR(optimizer = optimizer, total_steps = _A.total_iterations, warmup_steps = _A.warmup_steps)
-    scaler = GradScaler("cuda", enabled=_A.amp)
+    scaler = GradScaler("cuda", enabled=_A.amp, init_scale = 2048.0)
 
     checkpoint_manager = MeridianCheckpointManager(
         output_dir = _A.output_dir, model = model, optimizer = optimizer, scheduler = schedular, scaler = scaler
@@ -236,16 +257,73 @@ def main(_A: argparse.Namespace):
                 scale_hyp = outputs["scale_hyp"], entail_weight = outputs["entail_weight"],
                 alphas = outputs["alphas"],
             )
+            
+        # EARLY DETECTION: Halt training immediately if NaN is detected
+        if torch.isnan(loss):
+            logger.error(f"NaN loss detected at iteration {iteration}!")
+            logger.error(f"Outputs - Curv: {outputs['curv']}, Scale_hyp: {outputs['scale_hyp']}, Scale_eucl: {outputs['scale_eucl']}")
+            logger.error(f"Metrics: {metrics}")
+            
+            # DIAGNOSTIC: Log all learnable parameters to find the culprit
+            logger.error("\n=== PARAMETER DIAGNOSTICS ===")
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    has_nan = torch.isnan(param).any().item()
+                    has_inf = torch.isinf(param).any().item()
+                    val_mean = param.mean().item() if not (has_nan or has_inf) else "N/A"
+                    val_max = param.max().item() if not (has_nan or has_inf) else "N/A"
+                    logger.error(f"  {name}: NaN={has_nan}, Inf={has_inf}, Mean={val_mean}, Max={val_max}")
+            
+            # SAVE BATCH DATA FOR INSPECTION
+            nan_batch_data = {
+                "iteration": iteration,
+                "pixel_values": pixel_values.cpu().detach(),
+                "input_ids": input_ids.cpu().detach(),
+                "attention_mask": attention_mask.cpu().detach(),
+                "eos_indices": eos_indices.cpu().detach(),
+                "outputs": {k: v.cpu().detach() if isinstance(v, torch.Tensor) else v for k, v in outputs.items()},
+                "metrics": metrics,
+            }
+            
+            nan_batch_path = Path(_A.output_dir) / f"nan_batch_iter{iteration}.pkl"
+            with open(nan_batch_path, "wb") as f:
+                pickle.dump(nan_batch_data, f)
+            logger.error(f"Saved problematic batch data to: {nan_batch_path}")
+            
+            checkpoint_manager.save(iteration)
+            raise RuntimeError(f"Training halted due to NaN loss at iteration {iteration}")
 
-            scaler.scale(loss).backward()
-            old_scale = scaler.get_scale()
+        scaler.scale(loss).backward()
+        
+        # GLOBAL GRADIENT CLIPPING: Prevent exploding gradients across all parameters
+        # This is crucial for stability of learnable parameters like curvature
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
+        nan_in_grads = any(
+            p.grad is not None and not torch.isfinite(p.grad).all()
+            for p in model.parameters() if p.requires_grad
+        )
+        if nan_in_grads:
+            logger.warning(
+                f"Non-finite gradients at iter {iteration} — skipping update. "
+                f"Curv={outputs['curv'].item():.4f}, "
+                f"scale_hyp={outputs['scale_hyp'].item():.2f}, "
+                f"scale_eucl={outputs['scale_eucl'].item():.2f}"
+                f"entail_weight={outputs['entail_weight'].item():.2f}"
+                f"alphas={outputs['alphas']}"
+            )
+            optimizer.zero_grad(set_to_none=True)
+            scaler.update(new_scale=scaler.get_scale() / 2)
+            continue
 
-            scaler.step(optimizer)
-            scaler.update()
+        old_scale = scaler.get_scale()
+        scaler.step(optimizer)
+        scaler.update()
+        new_scale = scaler.get_scale()
 
-            new_scale = scaler.get_scale()
-            if new_scale >= old_scale:
-                schedular.step()
+        if new_scale >= old_scale:
+            schedular.step()
 
         step_time = time.perf_counter() - start_time
 

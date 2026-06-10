@@ -5,7 +5,7 @@
 [![Framework PyTorch](https://img.shields.io/badge/framework-PyTorch-ee4c2c.svg)](https://pytorch.org/)
 [![License CC-BY-NC](https://img.shields.io/badge/license-CC--BY--NC-red.svg)](LICENSE)
 
-Meridian is a vision-language representation model built directly on top of standard **CLIP (ViT-B/16)** backbones. Unlike typical contrastive models that project image and text vectors into a flat, Euclidean vector space, Meridian maps multimodal features onto a continuous **hyperbolic manifold** (specifically, the Lorentz manifold). 
+Meridian is a vision-language representation model built directly on top of standard **CLIP (ViT-B/16)** backbones. Unlike typical contrastive models that project image and text vectors into a flat, Euclidean vector space, Meridian maps multimodal features onto a continuous **hyperbolic manifold** (Lorentz manifold). 
 
 Because the volume of hyperbolic space grows exponentially rather than polynomially, it possesses an intrinsic "tree-like" geometry. This geometry makes Meridian exceptionally robust at capturing semantic hierarchies, complex taxonomies, and fine-grained conceptual ontologies without suffering from the representation collapse typical of Euclidean projections.
 
@@ -17,7 +17,7 @@ Because the volume of hyperbolic space grows exponentially rather than polynomia
 * **Non-Linear Hyperbolic Projection:** Custom multi-layer projection heads (`LayerAggregators`) map Euclidean embeddings smoothly into stable Lorentz manifold coordinates.
 * **Hierarchical Semantic Tracking:** Naturally groups open-vocabulary expressions into clean hierarchical tree splits (via Ward's linkage matrix), cleanly isolating distinct domain clusters.
 * **Scalable WebDataset Dataloader:** Built to stream large-scale pretraining datasets like Conceptual Captions 3M (CC3M) even through natural web URL decay.
-* **Flexible API:** Production-ready FastAPI endpoint for inference and batch processing.
+* **Flexible API:** Production-ready FastAPI endpoint for inference and batch processing [Not ready yet].
 
 ---
 
@@ -32,7 +32,7 @@ Hyperbolic geometry resolves this by introducing an implicit hierarchical gradie
 The geodesic distance between two points u and v within the Lorentz manifold is mathematically enforced via:
 
 ```
-d_B(u, v) = cosh^(-1)(1 + 2||u - v||^2 / ((1 - ||u||^2)(1 - ||v||^2)))
+$d_{\mathbb{B}}(u, v)=\operatorname{arcosh}\!\left(1+\frac{2\lVert u-v\rVert^2}{(1-\lVert u\rVert^2)(1-\lVert v\rVert^2)}\right)$
 ```
 
 As embeddings approach the boundary (||u||, ||v|| → 1), the denominator shrinks, causing the distance to grow exponentially—giving the model infinite room to isolate dense clusters cleanly.
@@ -46,7 +46,7 @@ This repository requires Python 3.12+ and utilizes `uv` for ultra-fast, reproduc
 ### Prerequisites
 
 - Python 3.12 or higher
-- CUDA 12.0+ (for GPU acceleration; CPU-only installation also supported)
+- CUDA 12.8+ (for GPU acceleration; CPU-only installation also supported)
 - `uv` package manager ([installation guide](https://docs.astral.sh/uv/getting-started/installation/))
 
 ### Installation Steps
@@ -70,7 +70,7 @@ This repository requires Python 3.12+ and utilizes `uv` for ultra-fast, reproduc
 
 4. **Download pre-trained checkpoints (optional):**
    ```bash
-   python scripts/download_models.py
+   uv run python -m scripts.download_models
    ```
 
 ---
@@ -82,12 +82,13 @@ This repository requires Python 3.12+ and utilizes `uv` for ultra-fast, reproduc
 To train a Meridian model on the CC3M dataset:
 
 ```bash
-python scripts/train.py \
-    --batch-size 256 \
-    --num-epochs 10 \
-    --learning-rate 1e-4 \
-    --projection-dim 256 \
-    --output-dir ./checkpoints/meridian_v1
+uv run python -m scripts.train \
+    --batch-size 128 \
+    --warmup-steps 2000
+    --total-iterations 10000 \
+    --output-dir meridian/checkpoints/meridian_v1 \
+    --workers 4
+
 ```
 
 ### Inference
@@ -106,10 +107,10 @@ from meridian.model import MeridianModel
 from meridian.tokenizer import Tokenizer
 
 # Load model
-model = MeridianModel.from_pretrained("checkpoints/meridian_v1")
+model = MeridianModel.from_pretrained("meridian/checkpoints/meridian_v1")
 model.eval()
 
-# Prepare inputs
+# Dummy inputs for Presentation
 image = torch.randn(1, 3, 224, 224)
 text_ids = torch.tensor([[1, 2, 3, ...]])
 
@@ -125,7 +126,7 @@ Run evaluation on downstream tasks:
 
 ```bash
 python scripts/evaluate.py \
-    --model-path checkpoints/meridian_v1 \
+    --model-path meridian/checkpoints/meridian_v1 \
     --eval-datasets imagenet zeroshot
 ```
 
@@ -147,6 +148,12 @@ Meridian/
 │   ├── tokenizer.py        # Text tokenization
 │   ├── data/               # Data loading utilities
 │   │   ├── cc3m.py        # CC3M dataloader
+|   |   ├── cc3m.tsv  # CC3M Image-link tsv([download link](https://huggingface.co/datasets/yxchng/cc15m_yfcc15m/resolve/main/cc3m.tsv))
+|   |   ├──cc3m_smoke/
+|   |   |   ├── *_stats.json
+|   |   |   ├── *_paraquet
+|   |   |   └── *.tar
+|   |   ├── dataset_download.py # (use to download dataset with --dataset argument or use CLI)
 │   │   ├── transforms.py  # Image/text preprocessing
 │   │   └── evaluation.py  # Evaluation dataset loaders
 │   └── utils/              # Utility functions
@@ -163,7 +170,7 @@ Meridian/
 │   ├── eval_zsc.py
 │   └── eval_retrieval.py
 ├── notebooks/             # Jupyter notebooks
-├── checkpoints/           # Model checkpoints
+├── checkpoints/           # Model checkpoints(frozen **CLIP (ViT-B/16)**)
 └── README.md
 ```
 
@@ -171,7 +178,7 @@ Meridian/
 
 ## Model Architecture
 
-Meridian consists of three main components:
+Meridian consists of 5 main components:
 
 1. **Image Encoder:** OpenAI CLIP ViT-B/16 vision transformer
 2. **Text Encoder:** OpenAI CLIP text transformer
@@ -180,8 +187,12 @@ Meridian consists of three main components:
    - Non-linear transformer adapters
    - Exponential map to Lorentz manifold
    - Lorentz distance-based contrastive loss
+4. **Euclidean Projection Head:**
+   - Same as the above but for normal euclidean manifold
+5. **Dynamic Gating between Euclidean Head and Hyperbolic Projection Heads**
+   - To let model decide when to focus on which head more
 
-The model is trained end-to-end using a custom hyperbolic contrastive loss function that respects the Riemannian geometry of the Lorentz manifold.
+The model is trained end-to-end using a hybrid hyperbolic–Euclidean contrastive loss. The objective combines Lorentzian contrastive learning, Euclidean contrastive learning, gated representation fusion, and hyperbolic entailment modeling while respecting the Riemannian geometry of the Lorentz manifold.
 
 ---
 
@@ -236,11 +247,12 @@ Contributions are welcome! Please:
 If you use Meridian in your research, please use the following BibTeX entry:
 
 ```bibtex
-@inproceedings{meridian2024,
-    title     = {{Meridian: Hyperbolic Image-Text Representations}},
-    author    = {Kaustuk and Collaborators},
-    booktitle = {Proceedings of the International Conference on Machine Learning},
-    year      = {2024}
+@misc{singh2026meridian,
+  title        = {Meridian: Hyperbolic Image--Text Representations},
+  author       = {Kaustuk Pratap Singh},
+  year         = {2026},
+  howpublished = {\url{https://github.com/<your-username>/Meridian}},
+  note         = {Open-source research project}
 }
 ```
 
@@ -251,7 +263,7 @@ This project builds upon and incorporates concepts from MERU. If you use any par
 ```bibtex
 @inproceedings{desai2023meru,
     title     = {{Hyperbolic Image-Text Representations}},
-    author    = {Desai, Karan and Nickel, Maximilian and Rajpurohit, Tanmay and Johnson, Justin and Vedantam, Ramakrishna},
+    author    = {Desai, Karan and Nickel, Maximilian and Rajpurohit, Tanmay and Johnson, Justin and Vedantam, Ramakrishna}
     booktitle = {Proceedings of the International Conference on Machine Learning},
     year      = {2023}
 }

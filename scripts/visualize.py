@@ -161,7 +161,7 @@ def main(args):
         clip_processor = CLIPProcessor.from_pretrained(hf_model_id)
 
     print(f"Loading fine-tuned Meridian model from {args.checkpoint}...")
-    meridian_model = MeridianModel(image_hout=16, image_eout=32, text_hout=16, text_eout=32).to(device)
+    meridian_model = MeridianModel(image_hout=16, image_eout=16, text_hout=16, text_eout=16).to(device)
     checkpoint = torch.load(args.checkpoint, map_location=device)
     state_dict = {k.replace("module.", ""): v for k, v in checkpoint["model_state_dict"].items()}
     meridian_model.load_state_dict(state_dict)
@@ -188,7 +188,16 @@ def main(args):
         "Powerful desktop computer",
         "Apple iPhone smartphone",
         "Mechanical gaming keyboard",
-        "High resolution monitor"
+        "High resolution monitor",
+        "Digital camera lens",
+        "Smartphone selfie camera",
+        "Stunning sunset over the ocean",
+        "Aerial view of the city skyline",
+        "Indian elephant",
+        "Tiger cub",
+        "Cute kitten", "Lion cub",
+        "Flamingo", "Eagle",
+        "Lioness", "Tiger",
     ]
     dummy_images = [Image.new("RGB", (224, 224), color=(20 * i, 60, 100)) for i in range(len(texts))]
 

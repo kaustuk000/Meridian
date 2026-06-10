@@ -10,3 +10,6 @@ wheels/
 .venv
 checkpoints
 meridian/data/cc3m.tsv
+meridian/data/cc3m_smoke.tsv
+meridian/data/cc3m_smoke
+output
