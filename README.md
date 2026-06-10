@@ -270,7 +270,7 @@ If you use Meridian in your research, please use the following BibTeX entry:
   title        = {Meridian: Hyperbolic Image--Text Representations},
   author       = {Kaustuk Pratap Singh},
   year         = {2026},
-  howpublished = {\url{https://github.com/<kaustuk000>/Meridian}},
+  howpublished = {\url{https://github.com/kaustuk000/Meridian}},
   note         = {Open-source research project}
 }
 ```
