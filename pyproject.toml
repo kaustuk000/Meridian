@@ -1,15 +1,16 @@
 [project]
 name = "meridian"
 version = "0.1.0"
-description = "Add your description here"
+description = "Meridian is a vision-language representation model built directly on top of standard CLIP (ViT-B/16) backbones. Unlike typical contrastive models that project image and text vectors into a flat, Euclidean vector space, Meridian maps multimodal features onto a continuous hyperbolic manifold (Lorentz manifold)."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "geoopt",
+    "fastapi[all]>=0.136.3",
     "img2dataset>=1.47.0",
     "loguru>=0.7.3",
     "matplotlib>=3.10.9",
     "open-clip-torch>=3.3.0",
+    "python-multipart>=0.0.32",
     "scikit-learn>=1.9.0",
     "setuptools>=82.0.1",
     "tensorboard>=2.20.0",

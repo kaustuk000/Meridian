@@ -11,13 +11,25 @@ Because the volume of hyperbolic space grows exponentially rather than polynomia
 
 ---
 
+## Architecture
+
+![Meridian Architecture](assets/Meridian%20Architecture.png)
 ## Key Features
 
 * **CLIP ViT-B/16 Foundation:** Leverages rich, pre-trained multimodal representations out-of-the-box before mapping to hyperbolic structures.
 * **Non-Linear Hyperbolic Projection:** Custom multi-layer projection heads (`LayerAggregators`) map Euclidean embeddings smoothly into stable Lorentz manifold coordinates.
 * **Hierarchical Semantic Tracking:** Naturally groups open-vocabulary expressions into clean hierarchical tree splits (via Ward's linkage matrix), cleanly isolating distinct domain clusters.
 * **Scalable WebDataset Dataloader:** Built to stream large-scale pretraining datasets like Conceptual Captions 3M (CC3M) even through natural web URL decay.
-* **Flexible API:** Production-ready FastAPI endpoint for inference and batch processing [Not ready yet].
+* **Flexible API:** Production-ready FastAPI endpoint for inference and batch processing.
+
+---
+## Highlights
+
+- **~6× Embedding Compression:** Reduced embedding storage requirements by approximately 6× compared to the CLIP baseline through hierarchical hyperbolic representations.
+- **~1.5× Faster Retrieval:** Achieved faster retrieval latency while maintaining strong semantic search capabilities.
+- **Hierarchical Multimodal Retrieval:** Organizes image-text data into semantic hierarchies for interpretable exploration and retrieval.
+- **Multimodal Search:** Supports text-to-image, image-to-image, and hybrid image+text retrieval.
+- **Interactive Visualization:** Generates navigable semantic trees for large-scale image collections.
 
 ---
 
@@ -40,6 +52,119 @@ where the Lorentzian inner product is:
 As embeddings approach the boundary (||u||, ||v|| → 1), the denominator shrinks, causing the distance to grow exponentially—giving the model infinite room to isolate dense clusters cleanly.
 
 ---
+
+## Hierarchy Comparison
+
+The examples below illustrate how Meridian learns cleaner semantic hierarchies than the frozen CLIP baseline by reducing cross-category mixing and improving semantic specialization when organizing concepts derived from text queries.
+
+### Example 1: Animal Concepts
+
+**Frozen CLIP (ViT-B/16)**
+
+<pre>
+Mixed Animal Region
+├── Dog + Cat
+├── Flower
+├── Lion
+├── Puppy
+├── Tiger
+├── Elephant
+└── Tree
+</pre>
+
+**Fine-Tuned Meridian**
+
+<pre>
+Feline Region
+├── Domestic Cat
+├── Domestic Kitten
+├── Tabby Cat
+├── Tabby Kitten
+├── Tiger
+├── Tiger Cub
+├── Lion
+├── Female Lion
+└── Big Cat Cub
+</pre>
+
+Meridian forms a coherent feline semantic neighborhood, while the frozen CLIP hierarchy mixes animals, plants, and unrelated concepts within the same region.
+
+---
+
+### Example 2: Transportation Concepts
+
+**Frozen CLIP (ViT-B/16)**
+
+<pre>
+Transportation Region
+├── Passenger Aircraft
+├── Cargo Truck
+├── Commercial Airliner
+├── Sports Car
+└── Semi Truck
+</pre>
+
+**Fine-Tuned Meridian**
+
+<pre>
+Aircraft
+├── Passenger Aircraft
+├── Commercial Airliner
+├── Fighter Jet
+└── Stealth Aircraft
+
+Ground Vehicles
+├── Cargo Truck
+├── Semi Truck
+└── Sports Car
+</pre>
+
+---
+
+### Example 3: Computing Devices
+
+**Frozen CLIP (ViT-B/16)**
+
+<pre>
+Mixed Technology Region
+├── Heavy Commercial Truck
+├── Photography Lens
+├── Mobile Phone Camera
+├── Smartphone
+├── Mechanical Keyboard
+├── Mirrorless Camera
+├── Laptop
+├── Monitor
+└── Workspace
+</pre>
+
+**Fine-Tuned Meridian**
+
+<pre>
+Workspace
+├── Laptop on Desk
+├── Thin Silver Laptop
+├── Office Laptop
+├── Ultrawide Monitor
+├── Keyboard
+├── Mouse
+├── Desktop Workstation
+└── Monitor Setup
+
+Camera System
+├── Mobile Phone Camera
+├── Photography Lens
+├── Mirrorless Camera
+└── Visual Memory Device
+</pre>
+
+Meridian organizes computing and imaging concepts into coherent semantic regions, whereas the frozen CLIP hierarchy mixes cameras, laptops, peripherals, smartphones, and unrelated objects within the same branch.
+
+Meridian separates aircraft and ground vehicles into distinct semantic branches, whereas the frozen CLIP hierarchy intermixes them within the same cluster.
+
+**Key Observation:** Meridian significantly reduces cross-category mixing and produces cleaner semantic neighborhoods, resulting in more interpretable hierarchical structures.
+
+
 
 ## Installation & Setup
 
@@ -127,11 +252,11 @@ with torch.no_grad():
         eos_indices=tokens["eos_indices"],
     )
 
-# Hyperbolic embeddings
+# Hyperbolic Head embeddings
 h_image = outputs["h_image"]
 h_text = outputs["h_text"]
 
-# Euclidean embeddings
+# Euclidean Head embeddings
 e_image = outputs["e_image"]
 e_text = outputs["e_text"]
 
@@ -158,7 +283,6 @@ Meridian/
 ├── api/                      # FastAPI inference server
 │   ├── app.py               # Application entry point
 │   ├── inference.py         # Inference pipeline
-│   └── schemas.py           # Request/response schemas
 ├── meridian/                # Core library
 │   ├── model.py            # Main Meridian model architecture
 │   ├── lorentz.py          # Hyperbolic geometry operations
@@ -167,7 +291,7 @@ Meridian/
 │   ├── tokenizer.py        # Text tokenization
 │   ├── data/               # Data loading utilities
 │   │   ├── cc3m.py        # CC3M dataloader
-|   |   ├── cc3m.tsv  # CC3M Image-link tsv([download link](https://huggingface.co/datasets/yxchng/cc15m_yfcc15m/resolve/main/cc3m.tsv))
+|   |   ├── cc3m.tsv # CC3M Image-link tsv([download link](https://huggingface.co/datasets/yxchng/cc15m_yfcc15m/resolve/main/cc3m.tsv))
 |   |   ├──cc3m_smoke/
 |   |   |   ├── *_stats.json
 |   |   |   ├── *_paraquet
@@ -190,6 +314,7 @@ Meridian/
 │   └── eval_retrieval.py
 ├── notebooks/             # Jupyter notebooks
 ├── checkpoints/           # Model checkpoints(frozen **CLIP (ViT-B/16)**)
+|── assets/
 └── README.md
 ```
 
