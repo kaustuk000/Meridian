@@ -1,270 +1,380 @@
-"""
-visualize_spaces.py
-===================
-Compares embedding spaces between untuned standard CLIP and fine-tuned Meridian.
-Projects embeddings to 2D, spreads labels evenly on an outer ring to eliminate clutter,
-and prints dual textual tree diagrams (Untuned vs Fine-Tuned) directly to the console.
-"""
+from __future__ import annotations
 
 import argparse
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.patches import Circle
-from sklearn.decomposition import PCA
-from scipy.cluster.hierarchy import linkage
-from PIL import Image
-from transformers import CLIPModel, CLIPProcessor
+import glob
+import math
+import os
+import shutil
+import json
+import webbrowser
+from pathlib import Path
 
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn.functional as F
+from PIL import Image
+
+# Import scipy for rigorous hierarchical clustering
+from scipy.cluster.hierarchy import linkage, to_tree, fcluster
+import scipy.spatial.distance as ssd
+
+from meridian.lorentz import lorentz_distance
 from meridian.model import MeridianModel
 from meridian.tokenizer import Tokenizer
+from app.inference import MeridianSearchEngine
 
-def project_to_2d(embeddings: torch.Tensor, is_hyperbolic: bool = False) -> np.ndarray:
-    """Reduces embeddings to 2D using PCA. Normalizes if hyperbolic."""
-    arr = embeddings.detach().cpu().numpy()
-    if arr.shape[1] > 2:
-        pca = PCA(n_components=2)
-        arr_2d = pca.fit_transform(arr)
-    else:
-        arr_2d = arr
 
-    if is_hyperbolic:
-        norms = np.linalg.norm(arr_2d, axis=1, keepdims=True)
-        max_norm = np.max(norms)
-        if max_norm > 0:
-            arr_2d = (arr_2d / max_norm) * 0.90
-    return arr_2d
+# ---------------------------------------------------------------------------
+# Setup & Helper Processing Methods
+# ---------------------------------------------------------------------------
 
-def print_ascii_tree(Z, labels, num_points, title_text):
-    """
-    Parses the hierarchical linkage matrix and prints a beautifully 
-    structured text tree directly to the terminal console.
-    """
-    # Create a map to hold the string representations of children/branches
-    tree_nodes = {i: [f"[{i+1}] {labels[i]}"] for i in range(num_points)}
-    
-    for i, edge in enumerate(Z):
-        child1_idx, child2_idx = int(edge[0]), int(edge[1])
-        parent_idx = num_points + i
-        
-        c1_lines = tree_nodes[child1_idx]
-        c2_lines = tree_nodes[child2_idx]
-        
-        # Build the structured branches textually
-        new_lines = []
-        new_lines.append("─┬─ " + c1_lines[0])
-        for line in c1_lines[1:]:
-            new_lines.append(" │  " + line)
-        new_lines.append(" └─ " + c2_lines[0])
-        for line in c2_lines[1:]:
-            new_lines.append("    " + line)
-            
-        tree_nodes[parent_idx] = new_lines
+def load_meridian_model(checkpoint_path: str, device: torch.device):
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
+    state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
 
-    # The final root node holds the entire combined tree structure
-    root_idx = num_points + len(Z) - 1
-    print("\n" + "="*70)
-    print(f"      {title_text} (READ LEFT-TO-RIGHT)")
-    print("="*70)
-    for line in tree_nodes[root_idx]:
-        print(line)
-    print("="*70 + "\n")
+    def _find_dim(prefix: str) -> int:
+        for k, v in state_dict.items():
+            if k.startswith(prefix) and k.endswith(".weight") and v.ndim == 2 and v.shape[1] == 128:
+                return int(v.shape[0])
+        raise RuntimeError(f"Could not infer dimension from checkpoint prefix '{prefix}'.")
 
-def draw_hierarchical_tree(ax, points, labels, color, is_hyperbolic=False):
-    """Plots nodes with cross-reference numbers and callout tracking lines."""
-    num_points = len(points)
-    
-    # 1. Plot the explicit scatter points
-    ax.scatter(points[:, 0], points[:, 1], c=color, zorder=5, s=120, edgecolors='black', linewidths=1.0)
-    
-    # 2. Add identification numbers inside the scatter nodes
-    for i in range(num_points):
-        ax.text(points[i, 0], points[i, 1], str(i + 1), color='white', fontsize=8, 
-                fontweight='bold', ha='center', va='center', zorder=6)
+    model = MeridianModel(
+        image_hout=_find_dim("hyp_image_head.image_mlp."),
+        image_eout=_find_dim("eucl_image_head.image_mlp."),
+        text_hout=_find_dim("hyp_text_head.text_mlp."),
+        text_eout=_find_dim("eucl_text_head.text_mlp.")
+    ).to(device)
+    model.load_state_dict(state_dict, strict=False)
+    model.eval()
+    return model
 
-    # 3. Compute uniform outer ring coordinates for labels
-    angles = np.arctan2(points[:, 1], points[:, 0])
-    sort_idx = np.argsort(angles)
-    
-    if is_hyperbolic:
-        base_radius = 1.20
-    else:
-        max_dist = np.max(np.linalg.norm(points, axis=1)) if num_points > 0 else 1.0
-        base_radius = max(max_dist * 1.4, 1.3)
+def pad_token_batch(tokenizer: Tokenizer, texts: list[str], device: torch.device):
+    token_list = tokenizer(texts)
+    max_len = 77
+    B = len(token_list)
+    input_ids = torch.zeros(B, max_len, dtype=torch.long, device=device)
+    attention_mask = torch.zeros(B, max_len, dtype=torch.long, device=device)
+    eos_indices = torch.zeros(B, dtype=torch.long, device=device)
 
-    target_angles = np.linspace(-np.pi, np.pi, num_points, endpoint=False)
-    
-    for rank, idx in enumerate(sort_idx):
-        x, y = points[idx, 0], points[idx, 1]
-        label = labels[idx]
-        tgt_angle = target_angles[rank]
-        
-        text_x = base_radius * np.cos(tgt_angle)
-        text_y = base_radius * np.sin(tgt_angle)
-        
-        ha = 'left' if np.cos(tgt_angle) >= 0 else 'right'
-        va = 'center'
-        
-        short_label = label if len(label) < 25 else label[:22] + "..."
-        display_str = f"[{idx + 1}] {short_label}"
-        
-        ax.plot([x, text_x], [y, text_y], color=color, alpha=0.3, linestyle=':', linewidth=1.0, zorder=2)
-        ax.text(
-            text_x, text_y, display_str, fontsize=8, fontweight='bold', color='black',
-            ha=ha, va=va, zorder=6,
-            bbox=dict(boxstyle="square,pad=0.2", facecolor='white', alpha=0.95, edgecolor=color, linewidth=0.5)
-        )
-
-    # 4. Compute Hierarchical Tree Splits & Plot them
-    if num_points > 1:
-        Z = linkage(points, method='ward')
-        node_positions = {i: (points[i, 0], points[i, 1]) for i in range(num_points)}
-        
-        for i, edge in enumerate(Z):
-            child1_idx, child2_idx = int(edge[0]), int(edge[1])
-            parent_idx = num_points + i
-            
-            p1 = node_positions[child1_idx]
-            p2 = node_positions[child2_idx]
-            parent_pos = ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
-            node_positions[parent_idx] = parent_pos
-            
-            ax.plot([p1[0], parent_pos[0]], [p1[1], parent_pos[1]], color=color, alpha=0.4, linestyle='-', linewidth=1.2, zorder=3)
-            ax.plot([p2[0], parent_pos[0]], [p2[1], parent_pos[1]], color=color, alpha=0.4, linestyle='-', linewidth=1.2, zorder=3)
-            
-        # Dynamically trigger console text tree output depending on layout target
-        if is_hyperbolic:
-            print_ascii_tree(Z, labels, num_points, title_text="FINE-TUNED MERIDIAN HIERARCHY")
-        else:
-            print_ascii_tree(Z, labels, num_points, title_text="UNTUNED CLIP BASELINE HIERARCHY")
-            
-    view_pad = base_radius * 1.55
-    ax.set_xlim(-view_pad, view_pad)
-    ax.set_ylim(-view_pad, view_pad)
-
-def main(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Running hierarchical visualization on: {device}")
-
-    # =========================================================================
-    # 1. Models Initialization
-    # =========================================================================
-    print("Loading untuned CLIP model...")
-    hf_model_id = "checkpoints/clip/hf_vitb16_openai"
-    try:
-        clip_model = CLIPModel.from_pretrained(hf_model_id).to(device).eval()
-        clip_processor = CLIPProcessor.from_pretrained(hf_model_id)
-    except Exception:
-        print("Local checkpoint missing. Defaulting to Central HF Hub weights...")
-        hf_model_id = "openai/clip-vit-base-patch16"
-        clip_model = CLIPModel.from_pretrained(hf_model_id).to(device).eval()
-        clip_processor = CLIPProcessor.from_pretrained(hf_model_id)
-
-    print(f"Loading fine-tuned Meridian model from {args.checkpoint}...")
-    meridian_model = MeridianModel(image_hout=16, image_eout=16, text_hout=16, text_eout=16).to(device)
-    checkpoint = torch.load(args.checkpoint, map_location=device)
-    state_dict = {k.replace("module.", ""): v for k, v in checkpoint["model_state_dict"].items()}
-    meridian_model.load_state_dict(state_dict)
-    meridian_model.eval()
-    
-    meridian_tokenizer = Tokenizer()
-
-    # =========================================================================
-    # 2. Setup Structured Text Data
-    # =========================================================================
-    texts = [
-        "Golden retriever dog", 
-        "German shepherd puppy",
-        "Fluffy white cat", 
-        "Sleek black panther",
-        "Red sports car", 
-        "Heavy cargo truck",
-        "Supersonic jet airplane",
-        "Military helicopter",
-        "Beautiful red rose", 
-        "Bright yellow sunflower",
-        "Ancient giant oak tree",
-        "Tall green pine tree",
-        "Powerful desktop computer",
-        "Apple iPhone smartphone",
-        "Mechanical gaming keyboard",
-        "High resolution monitor",
-        "Digital camera lens",
-        "Smartphone selfie camera",
-        "Stunning sunset over the ocean",
-        "Aerial view of the city skyline",
-        "Indian elephant",
-        "Tiger cub",
-        "Cute kitten", "Lion cub",
-        "Flamingo", "Eagle",
-        "Lioness", "Tiger",
-    ]
-    dummy_images = [Image.new("RGB", (224, 224), color=(20 * i, 60, 100)) for i in range(len(texts))]
-
-    # =========================================================================
-    # 3. Process Embeddings
-    # =========================================================================
-    hf_inputs = clip_processor(text=texts, images=dummy_images, return_tensors="pt", padding=True).to(device)
-    with torch.no_grad():
-        hf_outputs = clip_model(**hf_inputs)
-        hf_txt_embeds = hf_outputs.text_embeds
-    hf_txt_2d = project_to_2d(hf_txt_embeds, is_hyperbolic=False)
-
-    tokens = meridian_tokenizer(texts)
-    B = len(texts)
-    input_ids = torch.zeros(B, 77, dtype=torch.long)
-    attention_mask = torch.zeros(B, 77, dtype=torch.long)
-    eos_indices = torch.zeros(B, dtype=torch.long)
-    
-    for i, seq in enumerate(tokens):
-        n = min(len(seq), 77)
-        input_ids[i, :n] = seq[:n]
+    for i, tokens in enumerate(token_list):
+        seq = tokens[:max_len].long().to(device)
+        n = len(seq)
+        input_ids[i, :n] = seq
         attention_mask[i, :n] = 1
         eos_indices[i] = n - 1
-        
-    pixel_values = torch.randn(B, 3, 224, 224).to(device) 
+    return input_ids, attention_mask, eos_indices
 
-    with torch.no_grad():
-        meridian_outputs = meridian_model(
-            pixel_values=pixel_values,
-            input_ids=input_ids.to(device),
-            attention_mask=attention_mask.to(device),
-            eos_indices=eos_indices.to(device)
-        )
-    meridian_h_txt_2d = project_to_2d(meridian_outputs["h_text"], is_hyperbolic=True)
+def inverse_clip_normalize(batch: torch.Tensor) -> torch.Tensor:
+    mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=batch.device).view(1, 3, 1, 1)
+    std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=batch.device).view(1, 3, 1, 1)
+    return (batch * std + mean).clamp(0, 1)
 
-    # =========================================================================
-    # 4. Generate Plot Layout
-    # =========================================================================
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(24, 12))
-    fig.suptitle("Clean Tree Splits & Un-Cluttered Node Visualizations", fontsize=18, fontweight='bold')
-
-    # Left Panel: Euclidean space (Triggers UNTUNED ASCII output to terminal)
-    ax1.set_title("Untuned CLIP Baseline Space (Flat Euclidean PCA)", fontsize=14, pad=15)
-    draw_hierarchical_tree(ax1, hf_txt_2d, labels=texts, color="royalblue", is_hyperbolic=False)
-    ax1.axhline(0, color='gray', linewidth=0.5, alpha=0.3, linestyle=':')
-    ax1.axvline(0, color='gray', linewidth=0.5, alpha=0.3, linestyle=':')
-    ax1.grid(True, linestyle='--', alpha=0.2)
-    ax1.set_aspect('equal', 'box')
-
-    # Right Panel: Hyperbolic space (Triggers FINE-TUNED ASCII output to terminal)
-    ax2.set_title("Fine-Tuned Meridian Manifold (Hyperbolic Poincaré Tree Splits)", fontsize=14, pad=15)
-    disk = Circle((0, 0), 1.0, color='crimson', fill=False, linewidth=2.0, alpha=0.7)
-    ax2.add_patch(disk)
-    draw_hierarchical_tree(ax2, meridian_h_txt_2d, labels=texts, color="darkviolet", is_hyperbolic=True)
-    ax2.axhline(0, color='gray', linewidth=0.5, alpha=0.3, linestyle=':')
-    ax2.axvline(0, color='gray', linewidth=0.5, alpha=0.3, linestyle=':')
-    ax2.grid(True, linestyle='--', alpha=0.2)
-    ax2.set_aspect('equal', 'box')
-
+def display_image_grid(images: list[torch.Tensor], titles: list[str], ncols: int = 3, fig_title: str = ""):
+    n = len(images)
+    if n == 0:
+        print("No matches to visualize.")
+        return
+    ncols = max(1, min(ncols, n))
+    nrows = int(math.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows))
+    axes = np.array(axes).reshape(-1)
+    for ax in axes[n:]:
+        ax.axis("off")
+    for ax, img, title in zip(axes, images, titles):
+        img_np = inverse_clip_normalize(img.unsqueeze(0)).squeeze(0).permute(1, 2, 0).cpu().numpy()
+        ax.imshow(img_np)
+        ax.set_title(title, fontsize=8)
+        ax.axis("off")
+    if fig_title:
+        fig.suptitle(fig_title, fontsize=12, fontweight="bold")
     plt.tight_layout()
-    output_filename = "hierarchical_embedding_comparison.png"
-    plt.savefig(output_filename, dpi=300, bbox_inches='tight')
-    print(f"Plot successfully compiled and written to '{output_filename}'.")
     plt.show()
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate Word-Level Hierarchical Trees")
-    parser.add_argument("--checkpoint", type=str, default="./output/checkpoint_final.pt", help="Path to Meridian checkpoint file")
+# ---------------------------------------------------------------------------
+# Hierarchy Builders (Interactive Tree & Physical Folders)
+# ---------------------------------------------------------------------------
+
+def build_d3_tree_json(node, labels):
+    """Recursively parses scipy linkage tree into a nested dictionary for D3.js."""
+    if node.is_leaf():
+        return {"name": labels[node.id]}
+    return {
+        "name": f"Node_{node.id}",
+        "children": [
+            build_d3_tree_json(node.left, labels),
+            build_d3_tree_json(node.right, labels)
+        ]
+    }
+
+def generate_interactive_html(tree_dict, output_file="interactive_tree.html"):
+    """Embeds the hierarchy into a lightweight, interactive HTML file using D3.js."""
+    html_template = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Meridian Interactive Hierarchy</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        body {{ font-family: sans-serif; background: #f8f9fa; margin: 0; }}
+        .node circle {{ fill: #999; stroke: steelblue; stroke-width: 3px; cursor: pointer; }}
+        .node text {{ font: 12px sans-serif; fill: #333; }}
+        .link {{ fill: none; stroke: #ccc; stroke-width: 2px; }}
+        #title {{ text-align: center; padding: 20px; background: #fff; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+    </style>
+</head>
+<body>
+    <div id="title"><h2>Meridian Hierarchical Clustering Tree</h2><p>Click on nodes to expand/collapse</p></div>
+    <div id="d3-container"></div>
+    <script>
+        const treeData = {json.dumps(tree_dict)};
+        
+        const width = window.innerWidth - 100;
+        const dx = 20; const dy = width / 6;
+        const margin = {{top: 40, right: 120, bottom: 40, left: 120}};
+
+        const tree = d3.tree().nodeSize([dx, dy]);
+        const diagonal = d3.linkHorizontal().x(d => d.y).y(d => d.x);
+
+        const svg = d3.select("#d3-container").append("svg")
+            .attr("width", width)
+            .attr("height", 1000)
+            .attr("viewBox", [-margin.left, -margin.top, width, dx]);
+
+        const gLink = svg.append("g").attr("fill", "none").attr("stroke", "#555").attr("stroke-opacity", 0.4).attr("stroke-width", 1.5);
+        const gNode = svg.append("g").attr("cursor", "pointer").attr("pointer-events", "all");
+
+        const root = d3.hierarchy(treeData);
+        root.x0 = dy / 2; root.y0 = 0;
+        
+        // Collapse by default for large trees
+        if (root.children) root.children.forEach(collapse);
+        function collapse(d) {{ if(d.children) {{ d._children = d.children; d._children.forEach(collapse); d.children = null; }} }}
+
+        update(root);
+
+        function update(source) {{
+            const nodes = root.descendants().reverse();
+            const links = root.links();
+            
+            tree(root);
+            
+            let left = root; let right = root;
+            root.eachBefore(node => {{ if (node.x < left.x) left = node; if (node.x > right.x) right = node; }});
+            const height = right.x - left.x + margin.top + margin.bottom;
+            svg.transition().duration(250).attr("viewBox", [-margin.left, left.x - margin.top, width, height]);
+
+            const node = gNode.selectAll("g").data(nodes, d => d.id || (d.id = ++i));
+            let i = 0;
+
+            const nodeEnter = node.enter().append("g")
+                .attr("transform", d => `translate(${{source.y0}},${{source.x0}})`)
+                .attr("fill-opacity", 0)
+                .attr("stroke-opacity", 0)
+                .on("click", (event, d) => {{
+                    d.children = d.children ? null : d._children;
+                    update(d);
+                }});
+
+            nodeEnter.append("circle").attr("r", 4.5).attr("fill", d => d._children ? "#555" : "#999").attr("stroke-width", 10);
+            nodeEnter.append("text").attr("dy", "0.31em").attr("x", d => d._children ? -6 : 6).attr("text-anchor", d => d._children ? "end" : "start")
+                .text(d => d.data.name).clone(true).lower().attr("stroke-linejoin", "round").attr("stroke-width", 3).attr("stroke", "white");
+
+            const nodeUpdate = node.merge(nodeEnter).transition().duration(250)
+                .attr("transform", d => `translate(${{d.y}},${{d.x}})`)
+                .attr("fill-opacity", 1).attr("stroke-opacity", 1);
+            
+            nodeUpdate.select("circle").attr("fill", d => d._children ? "#555" : "#999");
+
+            const nodeExit = node.exit().transition().duration(250).remove()
+                .attr("transform", d => `translate(${{source.y}},${{source.x}})`).attr("fill-opacity", 0).attr("stroke-opacity", 0);
+
+            const link = gLink.selectAll("path").data(links, d => d.target.id);
+            const linkEnter = link.enter().append("path").attr("d", d => {{ const o = {{x: source.x0, y: source.y0}}; return diagonal({{source: o, target: o}}); }});
+            link.merge(linkEnter).transition().duration(250).attr("d", diagonal);
+            link.exit().transition().duration(250).remove().attr("d", d => {{ const o = {{x: source.x, y: source.y}}; return diagonal({{source: o, target: o}}); }});
+
+            root.eachBefore(d => {{ d.x0 = d.x; d.y0 = d.y; }});
+        }}
+    </script>
+</body>
+</html>
+    """
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(html_template)
+    return output_file
+
+# ---------------------------------------------------------------------------
+# Core Interactive Search & Hierarchy System
+# ---------------------------------------------------------------------------
+
+def run_search_query(model, tokenizer, engine, text_query, image_path, topk, device):
+    """Processes search queries with support for single or comma-separated strings."""
+    queries = [text_query] if text_query and "," not in text_query else ([t.strip() for t in text_query.split(",")] if text_query else [None])
+    
+    for q in queries:
+        has_text = q is not None and len(q) > 0
+        has_img = image_path is not None and os.path.exists(image_path)
+        
+        pixel_values = torch.zeros(1, 3, 224, 224, device=device) # Dummy tensor placeholder
+        input_ids, attention_mask, eos_indices = pad_token_batch(tokenizer, [q if has_text else "a photo"], device)
+        
+        with torch.no_grad():
+            outputs = model(pixel_values=pixel_values, input_ids=input_ids, attention_mask=attention_mask, eos_indices=eos_indices)
+            
+        query_payload = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in outputs.items()}
+        scores = engine.compute_scores(query_payload, query_has_text=has_text, query_has_image=has_img)
+        
+        values, indices = torch.topk(scores, k=min(topk, len(scores)))
+        
+        title_str = f"Query Result for: '{q}'" if q else "Query Result for Image input"
+        print(f"\n{title_str}\n" + "-"*len(title_str))
+        
+        picked_imgs, picked_titles = [], []
+        for rank, (score, idx) in enumerate(zip(values.tolist(), indices.tolist()), 1):
+            caption = engine.index["captions"][idx]
+            print(f"  {rank}. {caption} (Score={score:.4f})")
+            picked_imgs.append(engine.index["pixel_values"][idx])
+            picked_titles.append(f"Rank {rank}\nScore: {score:.4f}")
+            
+        display_image_grid(picked_imgs, picked_titles, ncols=3, fig_title=title_str)
+
+def run_hierarchy_folder(model, tokenizer, folder_path, device):
+    """Evaluates images, computes exact hyperbolic manifolds, and outputs interactive trees & folder clusters."""
+    if not os.path.exists(folder_path):
+        print(f"Error: Target directory does not exist: {folder_path}")
+        return
+        
+    img_paths = []
+    for ext in ["*.jpg", "*.jpeg", "*.png", "*.BMP", "*.webp"]:
+        img_paths.extend(glob.glob(os.path.join(folder_path, ext)))
+        
+    if not img_paths:
+        print(f"No valid image files discovered inside: {folder_path}")
+        return
+        
+    print(f"\nDiscovered {len(img_paths)} images.")
+    use_filenames = input("Do you want to use the filenames as semantic text queries to refine the clustering? (y/n): ").strip().lower() == 'y'
+    
+    print(f"Processing topological manifold constraints...")
+    h_image_feats, h_text_feats, labels = [], [], []
+    
+    for path in sorted(img_paths):
+        name = os.path.basename(path)
+        # We parse the filename cleanly just in case they opted in
+        text_query = os.path.splitext(name)[0].replace("_", " ").replace("-", " ") if use_filenames else "a photo"
+        
+        pixel_values = torch.zeros(1, 3, 224, 224, device=device) # Dummy visual tensor 
+        input_ids, attention_mask, eos_indices = pad_token_batch(tokenizer, [text_query], device)
+        
+        with torch.no_grad():
+            outputs = model(pixel_values=pixel_values, input_ids=input_ids, attention_mask=attention_mask, eos_indices=eos_indices)
+        
+        h_image_feats.append(outputs["h_image"])
+        h_text_feats.append(outputs["h_text"])
+        labels.append(name)
+
+    n = len(labels)
+    # Pre-compute exact pairwise distance matrix mathematically
+    dist_matrix = np.zeros((n, n))
+    curv = torch.tensor(1.0, device=device)
+    
+    print("Calculating pairwise distances...")
+    with torch.no_grad():
+        for i in range(n):
+            for j in range(i + 1, n):
+                # If they opted to use filenames, we fuse the text distance and image distance
+                if use_filenames:
+                    d_img = lorentz_distance(h_image_feats[i], h_image_feats[j], curv).item()
+                    d_txt = lorentz_distance(h_text_feats[i], h_text_feats[j], curv).item()
+                    dist = 0.5 * d_img + 0.5 * d_txt
+                else:
+                    dist = lorentz_distance(h_image_feats[i], h_image_feats[j], curv).item()
+                    
+                dist_matrix[i, j] = dist_matrix[j, i] = dist
+
+    # Convert to SciPy condensed format and perform hierarchical linking
+    condensed_dist = ssd.squareform(dist_matrix)
+    Z = linkage(condensed_dist, method='average')
+    
+    # 1. Output the interactive D3 web tree
+    tree_root, _ = to_tree(Z, rd=True)
+    tree_dict = build_d3_tree_json(tree_root, labels)
+    html_path = generate_interactive_html(tree_dict)
+    
+    print(f"\nSuccess! Interactive web tree saved to '{html_path}'.")
+    webbrowser.open('file://' + os.path.realpath(html_path))
+    
+    # 2. Provide the option to physically export folders
+    print("\nThe model can automatically organize your files based on this structural hierarchy.")
+    export_sys = input("Do you want to save this as a physical folder system? (y/n): ").strip().lower() == 'y'
+    
+    if export_sys:
+        num_clusters = input("How many main categorical folders do you want? [Default: 5]: ").strip()
+        num_clusters = int(num_clusters) if num_clusters.isdigit() else 5
+        
+        output_dir = os.path.join(folder_path, "Meridian_Clusters")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Determine flat clusters based on max requested folders
+        cluster_assignments = fcluster(Z, t=num_clusters, criterion='maxclust')
+        
+        print(f"\nMoving files into {num_clusters} semantic clusters...")
+        for idx, (path, cluster_id) in enumerate(zip(sorted(img_paths), cluster_assignments)):
+            cluster_folder = os.path.join(output_dir, f"Cluster_{cluster_id}")
+            os.makedirs(cluster_folder, exist_ok=True)
+            shutil.copy2(path, os.path.join(cluster_folder, os.path.basename(path)))
+            
+        print(f"Done! Files organized inside: {output_dir}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Persistent Interactive Visual Hub for Meridian.")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint weights.")
+    parser.add_argument("--index", type=str, required=True, help="Path to index cache file.")
+    parser.add_argument("--topk", type=int, default=9, help="Number of neighbors to return.")
     args = parser.parse_args()
-    main(args)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    print("Initializing environment components...")
+    model = load_meridian_model(args.checkpoint, device)
+    tokenizer = Tokenizer()
+    engine = MeridianSearchEngine(args.index)
+
+    print("\nInitialization Complete. Entering persistent session loop.")
+    while True:
+        print("\nSelect a Visual Verification Sub-mode:")
+        print("  1. Text Query Search (comma-separated lists supported)")
+        print("  2. Image Query Search")
+        print("  3. Multimodal Joint Search")
+        print("  4. Semantic Folder Organization & Interactive Tree")
+        print("  5. Exit")
+        
+        mode = input("\nEnter choice index [1-5]: ").strip()
+        if mode == "5" or mode.lower() == "exit":
+            print("Closing session.")
+            break
+            
+        if mode == "1":
+            text_in = input("Enter search phrase string: ").strip()
+            if text_in: run_search_query(model, tokenizer, engine, text_in, None, args.topk, device)
+                
+        elif mode == "2":
+            img_path = input("Enter path to query image: ").strip()
+            if img_path: run_search_query(model, tokenizer, engine, None, img_path, args.topk, device)
+                
+        elif mode == "3":
+            text_in = input("Enter search phrase string: ").strip()
+            img_path = input("Enter path to query image: ").strip()
+            run_search_query(model, tokenizer, engine, text_in, img_path, args.topk, device)
+            
+        elif mode == "4":
+            dir_path = input("Enter local folder path containing target image files: ").strip()
+            if dir_path: run_hierarchy_folder(model, tokenizer, dir_path, device)
+        else:
+            print("Invalid entry selection.")
+
+if __name__ == "__main__":
+    main()

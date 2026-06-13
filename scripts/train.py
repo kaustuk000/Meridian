@@ -147,15 +147,15 @@ parser.add_argument("--lr", type = float, default = 5e-4, help = "Peak learning 
 parser.add_argument("--weight-decay", type = float, default = 0.2, help = "AdamW weight decay configuration.")
 parser.add_argument("--batch-size", type = int, default = 64, help = "Training batch size.")
 parser.add_argument("--amp", action = "store_true", help = "Enable automatic mixed precision training.") 
-parser.add_argument("--workers", type = int, default = 6, help = "Dataloader worker threads.")
+parser.add_argument("--workers", type = int, default = 8, help = "Dataloader worker threads.")
 
 # Architecture Specific Params
-parser.add_argument("--image-hout", type = int, default = 16, help = "Hyperbolic out dimension for image.")
-parser.add_argument("--image-eout", type = int, default = 16, help = "Euclidean out dimension for image.")
-parser.add_argument("--text-hout", type = int, default = 16, help = "Hyperbolic out dimension for text.")
-parser.add_argument("--text-eout", type = int, default = 16, help = "Euclidean out dimension for text.")
+parser.add_argument("--image-hout", type = int, default = 32, help = "Hyperbolic out dimension for image.")
+parser.add_argument("--image-eout", type = int, default = 32, help = "Euclidean out dimension for image.")
+parser.add_argument("--text-hout", type = int, default = 32, help = "Hyperbolic out dimension for text.")
+parser.add_argument("--text-eout", type = int, default = 32, help = "Euclidean out dimension for text.")
 
-paraser = paraser.add_argument("--eucl_weight", type = float, default = 1.0, help = "Euclidean contrastive loss weight.")
+parser.add_argument("--eucl_weight", type = float, default = 0.75, help = "Euclidean contrastive loss weight.")
 parser.add_argument("--gate_weight", type = float, default = 1.0, help = "Gated fusion loss weight.")
 
 def main(_A: argparse.Namespace):
@@ -193,7 +193,7 @@ def main(_A: argparse.Namespace):
         weight_decay = _A.weight_decay,
         gain_bias_decay = 0.0,
         exclude_params = [
-            "curv", "logit_scale_hyp", "logit_scale_eucl",
+            "curv", "logit_scale_eucl",
             "log_alpha_img", "log_alpha_txt", "entail_weight"
         ]
     )
@@ -254,14 +254,14 @@ def main(_A: argparse.Namespace):
                 e_image = outputs["e_image"], e_text = outputs["e_text"],
                 a = outputs["a"], b = outputs["b"],
                 curv = outputs["curv"], scale_eucl = outputs["scale_eucl"],
-                scale_hyp = outputs["scale_hyp"], entail_weight = outputs["entail_weight"],
+                entail_weight = outputs["entail_weight"],
                 alphas = outputs["alphas"],
             )
             
         # EARLY DETECTION: Halt training immediately if NaN is detected
         if torch.isnan(loss):
             logger.error(f"NaN loss detected at iteration {iteration}!")
-            logger.error(f"Outputs - Curv: {outputs['curv']}, Scale_hyp: {outputs['scale_hyp']}, Scale_eucl: {outputs['scale_eucl']}")
+            logger.error(f"Outputs - Curv: {outputs['curv']},Scale_eucl: {outputs['scale_eucl']}")
             logger.error(f"Metrics: {metrics}")
             
             # DIAGNOSTIC: Log all learnable parameters to find the culprit
@@ -308,7 +308,6 @@ def main(_A: argparse.Namespace):
             logger.warning(
                 f"Non-finite gradients at iter {iteration} — skipping update. "
                 f"Curv={outputs['curv'].item():.4f}, "
-                f"scale_hyp={outputs['scale_hyp'].item():.2f}, "
                 f"scale_eucl={outputs['scale_eucl'].item():.2f}"
                 f"entail_weight={outputs['entail_weight'].item():.2f}"
                 f"alphas={outputs['alphas']}"
@@ -336,10 +335,9 @@ def main(_A: argparse.Namespace):
                 routing_entropy = -torch.sum(gating_probs * torch.log(gating_probs + eps), dim = -1).mean().item()
 
                 curv_val = outputs["curv"].item()
-                temp_hyp = outputs["scale_hyp"].item()
                 temp_euc = outputs["scale_eucl"].item() 
 
-                alpha_img_h, alpha_txt_h, alpha_img_e, alpha_txt_e = [a.item() for a in outputs["alphas"]] 
+                alpha_img_h, alpha_txt_h = [a.item() for a in outputs["alphas"]] 
                 current_lr = schedular.get_last_lr()[0]
 
             # Output comprehensive console diagnostics tracking space balances
@@ -355,10 +353,12 @@ def main(_A: argparse.Namespace):
             log_str = (
                 f"Iter {iteration}/{_A.total_iterations} | "
                 f"Loss: {loss.item():.4f} | "
+                f"entailment Loss: {metrics["loss/entailment"]:.4f} |"
                 f"Time: {step_time:.3f}s | "
                 f"LR: {current_lr:.2e} | "
                 f"Entropy: {routing_entropy:.3f} | "
                 f"Curv: {curv_val:.4f} | "
+                f"Entail_weight: {outputs["entail_weight"]:.3f} |"
                 f"GPU Alloc: {mem['allocated_gb']:.2f}GB | "
                 f"GPU Reserved: {mem['reserved_gb']:.2f}GB | "
                 f"GPU Peak: {mem['max_allocated_gb']:.2f}GB | "
@@ -376,12 +376,10 @@ def main(_A: argparse.Namespace):
             tboard.add_scalar("Router/Mean_A_Hyp", outputs["a"].mean().item(), iteration)
             tboard.add_scalar("Router/Mean_B_Euc", outputs["b"].mean().item(), iteration)
             tboard.add_scalar("Geometry/Curvature", curv_val, iteration)
-            tboard.add_scalar("Geometry/Temperature_Hyperbolic", temp_hyp, iteration)
             tboard.add_scalar("Geometry/Temperature_Euclidean", temp_euc, iteration)
             tboard.add_scalar("Alphas/Hyperbolic_Image", alpha_img_h, iteration)
             tboard.add_scalar("Alphas/Hyperbolic_Text", alpha_txt_h, iteration)
-            tboard.add_scalar("Alphas/Euclidean_Image", alpha_img_e, iteration)
-            tboard.add_scalar("Alphas/Euclidean_Text", alpha_txt_e, iteration)
+
 
             tboard.add_scalar(
                 "GPU/Allocated_GB",
@@ -406,10 +404,9 @@ def main(_A: argparse.Namespace):
         if iteration % _A.checkpoint_period == 0:
             checkpoint_manager.save(iteration)
 
-    # Save final operational weights at end of training
+   
     checkpoint_manager.save(_A.total_iterations, is_final=True)
 
-    # Export a clean snapshot matching production-only distribution files
     checkpoint_manager.export_clean_weights("meridian_final_weights.pt")
     tboard.close()
     del model
