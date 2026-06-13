@@ -23,12 +23,10 @@ def lorentz_inner_product(x: Tensor, y: Tensor, curv: float | Tensor = 1.0) -> T
     Returns:
         Tensor of shape (B1, B2) representing the Lorentzian inner product between x and y
     """
-    # Safety: Clamp curvature to prevent numerical issues
-    curv = torch.clamp(curv, min=1e-4, max=1e4)
-    
+
     # Calculate the time component of the Lorentzian coordinates
-    x_time = torch.sqrt(torch.clamp((1.0/curv) + torch.sum(x**2, dim=-1, keepdim=True), min=1e-4))
-    y_time = torch.sqrt(torch.clamp((1.0/curv) + torch.sum(y**2, dim=-1, keepdim=True), min=1e-4))
+    x_time = torch.sqrt((1.0/curv) + torch.sum(x**2, dim=-1, keepdim=True))
+    y_time = torch.sqrt((1.0/curv) + torch.sum(y**2, dim=-1, keepdim=True))
 
     # Calculate the Lorentzian inner product
     _lorentz_product = x @ y.T - x_time @ y_time.T
@@ -45,15 +43,13 @@ def lorentz_distance(x: Tensor, y: Tensor, curv: float | Tensor = 1.0, eps: floa
     Returns:
         Tensor of shape (B1, B2) representing the Lorentzian distance between x and y
     """
-    # Safety: Clamp curvature to prevent numerical issues
-    curv = torch.clamp(curv, min=1e-4, max=1e4)
     
     curv_lorentz_product = -curv * lorentz_inner_product(x, y, curv)
     # Ensure numerical stability: clamp to valid range for acosh (min=1.0)
     # But also set a max to prevent log(inf)
-    clamped_product = torch.clamp(curv_lorentz_product, min=1.0 + eps, max=1e8)
+    clamped_product = torch.clamp(curv_lorentz_product, min=1.0 + eps)
     _lorentz_distance = torch.acosh(clamped_product)
-    return _lorentz_distance / torch.clamp(curv**0.5, min=1e-2)
+    return _lorentz_distance / curv**0.5
 
 def exp_map0(x: Tensor, curv: float | Tensor = 1.0, eps: float = 1e-8) -> Tensor:
     """
@@ -65,13 +61,10 @@ def exp_map0(x: Tensor, curv: float | Tensor = 1.0, eps: float = 1e-8) -> Tensor
 
     Returns:
         Tensor of shape (B, D) representing the points on the hyperboloid corresponding to the input Euclidean vectors
-    """
-    # Safety: Clamp curvature
-    curv = torch.clamp(curv, min=1e-4, max=1e4)
-    
-    rootc_xnorm = (curv**0.5) * torch.norm(x + 1e-15, dim=-1, keepdim=True)
+    """    
+    rootc_xnorm = (curv**0.5) * torch.norm(x , dim=-1, keepdim=True)
     # Clamp sinh_input more conservatively to avoid overflow
-    sinh_input = torch.clamp(rootc_xnorm, min=eps, max=10.0)
+    sinh_input = torch.clamp(rootc_xnorm, min=eps, max=math.asinh(2**15))
     _sinh_output = (torch.sinh(sinh_input) * x) / torch.clamp(rootc_xnorm, min=eps)
     return _sinh_output
 
@@ -100,15 +93,12 @@ def log_map0(x: Tensor, curv: float | Tensor = 1.0, eps: float = 1e-8) -> Tensor
     Returns:
         Tensor of shape (B, D) containing the corresponding vectors in the
         tangent space at the hyperboloid origin.
-    """
-    # Safety: Clamp curvature
-    curv = torch.clamp(curv, min=1e-4, max=1e4)
-    
+    """    
     # Calculate distance of vectors to the hyperboloid vertex.
-    rootc_xtime = torch.sqrt(torch.clamp(1 + curv * torch.sum(x**2, dim=-1, keepdim=True), min=1e-4))
-    _distance = torch.acosh(torch.clamp(rootc_xtime, min=1 + eps, max=1e8))
+    rootc_xtime = torch.sqrt(1 + curv * torch.sum(x**2, dim=-1, keepdim=True))
+    _distance = torch.acosh(torch.clamp(rootc_xtime, min=1 + eps))
 
-    rootc_xnorm = (curv**0.5) * torch.norm(x + 1e-15, dim=-1, keepdim=True)
+    rootc_xnorm = (curv**0.5) * torch.norm(x , dim=-1, keepdim=True)
     _log_output = _distance * x / torch.clamp(rootc_xnorm, min=eps)
     return _log_output
 
@@ -126,7 +116,7 @@ def half_aperture_angle(x: Tensor, curv: float | Tensor = 1.0, k: float = 0.1, e
         Values are in the range of (0, pi/2)
     """
 
-    asin_input = torch.clamp((2* k ) / ((curv**0.5) * torch.norm(x + 1e-15, dim=-1) + eps), min = -1 + eps, max = 1 - eps)
+    asin_input = torch.clamp((2* k ) / ((curv**0.5) * torch.norm(x , dim=-1)), min = -1 + eps, max = 1 - eps)
     return torch.asin(asin_input)
 
 def exterior_angle(x: Tensor, y: Tensor, curv: float | Tensor = 1.0, eps: float = 1e-8) -> Tensor:
@@ -142,15 +132,14 @@ def exterior_angle(x: Tensor, y: Tensor, curv: float | Tensor = 1.0, eps: float 
         Tensor of shape (B,) containing the exterior angle between each pair of points on the hyperboloid.
         Values are in the range of (0, pi) 
     """
-    curv = torch.clamp(curv, min = 1e-4, max = 1e4)  
 
-    x_time = torch.sqrt(torch.clamp((1.0/curv) + torch.sum(x**2, dim = -1), min = 1e-4))
-    y_time = torch.sqrt(torch.clamp((1.0/curv) + torch.sum(y**2, dim = -1), min = 1e-4))
+    x_time = torch.sqrt((1.0/curv) + torch.sum(x**2, dim = -1))
+    y_time = torch.sqrt((1.0/curv) + torch.sum(y**2, dim = -1))
 
     curv_lorentz_product = curv * (torch.sum(x * y, dim = -1) - x_time * y_time)
     acos_input_num = y_time + x_time * curv_lorentz_product
     acos_input_den = (
-        torch.sqrt(torch.clamp((curv_lorentz_product**2) - 1, min = eps))
+        torch.sqrt(torch.clamp(curv_lorentz_product**2 - 1, min = eps))
         * torch.norm(x + 1e-15, dim = -1) + eps
     )
     return torch.acos(torch.clamp(acos_input_num / acos_input_den, min = -1 + eps, max = 1 - eps))

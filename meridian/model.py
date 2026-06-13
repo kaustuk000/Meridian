@@ -82,6 +82,7 @@ class HyperbolicImageHead(nn.Module):
         self.image_mlp = nn.Sequential(
             nn.Linear(input_dim, 128),
             QuickGelu(),
+            nn.Dropout(p=0.1),
             nn.Linear(128, out_dim),
         )
 
@@ -91,7 +92,7 @@ class HyperbolicImageHead(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-        self.log_alpha_img = nn.Parameter(torch.tensor((1.0 / out_dim)).log())  # Initialize alpha to a small value
+        self.log_alpha_img = nn.Parameter(torch.tensor(out_dim**-0.5).log())  # Initialize alpha to a small value
         
     def forward(self, image_tokens: Tensor, key_padding_mask: Tensor | None = None, curv: float | Tensor = 1.0) -> Tensor:
         image_tokens = self.image_adapter(image_tokens, key_padding_mask=key_padding_mask)
@@ -99,7 +100,7 @@ class HyperbolicImageHead(nn.Module):
         v = self.image_mlp(cls_token)
 
         with torch.autocast(device_type=v.device.type, dtype=torch.float32):
-            alpha = torch.clamp(self.log_alpha_img, max = 0.0).exp()
+            alpha = self.log_alpha_img.exp()
             v = alpha * v
             h_image = exp_map0(v, curv = curv) # Map to hyperbolic space using expmap0
         return h_image
@@ -121,6 +122,7 @@ class HyperbolicTextHead(nn.Module):
         self.text_mlp = nn.Sequential(
             nn.Linear(input_dim, 128),
             QuickGelu(),
+            nn.Dropout(p=0.1),
             nn.Linear(128, out_dim),
         )
 
@@ -130,7 +132,7 @@ class HyperbolicTextHead(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-        self.log_alpha_txt = nn.Parameter(torch.tensor((1.0 / out_dim)).log())  # Initialize alpha to a small value
+        self.log_alpha_txt = nn.Parameter(torch.tensor(out_dim**-0.5).log())  # Initialize alpha to a small value
 
     def forward(self, text_tokens: Tensor, eos_indices: Tensor, attention_mask: Tensor | None = None, curv: float | Tensor = 1.0) -> Tensor:
         key_padding_mask = None
@@ -146,7 +148,7 @@ class HyperbolicTextHead(nn.Module):
         v = self.text_mlp(eos_token)
 
         with torch.autocast(device_type=v.device.type, dtype=torch.float32):
-            alpha = torch.clamp(self.log_alpha_txt, max = 0.0).exp()
+            alpha = self.log_alpha_txt.exp()
             v = alpha * v
             h_text = exp_map0(v, curv = curv) # Map to hyperbolic space using expmap0
         return h_text
@@ -158,6 +160,7 @@ class EuclideanImageHead(nn.Module):
         self.image_mlp = nn.Sequential(
             nn.Linear(input_dim, 128),
             QuickGelu(),
+            nn.Dropout(p=0.1),
             nn.Linear(128, out_dim),
         )
 
@@ -166,17 +169,12 @@ class EuclideanImageHead(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-
-        self.log_alpha_img = nn.Parameter(torch.tensor((1.0 / out_dim)).log())  # Initialize alpha to a small value
         
     def forward(self, image_tokens: Tensor, key_padding_mask: Tensor | None = None) -> Tensor:
         image_tokens = self.image_adapter(image_tokens, key_padding_mask=key_padding_mask)
         cls_token = image_tokens[:,0] # Extract CLS token
         v = self.image_mlp(cls_token)
-
-        with torch.autocast(device_type=v.device.type, dtype=torch.float32):
-            alpha = torch.clamp(self.log_alpha_img, max = 0.0).exp()
-            e_image = alpha * v
+        e_image = F.normalize(v,dim = -1, eps=1e-6)
         return e_image
 
 class EuclideanTextHead(nn.Module):
@@ -186,6 +184,7 @@ class EuclideanTextHead(nn.Module):
         self.text_mlp = nn.Sequential(
             nn.Linear(input_dim, 128),
             QuickGelu(),
+            nn.Dropout(p=0.1),
             nn.Linear(128, out_dim),
         )
 
@@ -194,8 +193,6 @@ class EuclideanTextHead(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-
-        self.log_alpha_txt = nn.Parameter(torch.tensor((1.0 / out_dim)).log())  # Initialize alpha to a small value
 
     def forward(self, text_tokens: Tensor, eos_indices: Tensor, attention_mask: Tensor | None = None) -> Tensor:
         key_padding_mask = None
@@ -209,14 +206,11 @@ class EuclideanTextHead(nn.Module):
         eos_token = text_tokens[batch_idx, eos_indices]
 
         v = self.text_mlp(eos_token)
-
-        with torch.autocast(device_type=v.device.type, dtype=torch.float32):
-            alpha = torch.clamp(self.log_alpha_txt, max = 0.0).exp()
-            e_text = alpha * v
+        e_text = F.normalize(v, dim = -1, eps=1e-6)
         return e_text
 
 class PerModalityGate(nn.Module):
-    def __init__(self, hyp_dim: int = 16, eucl_dim: int = 32, clip_dim: int = 512):
+    def __init__(self, hyp_dim: int = 16, eucl_dim: int = 16, clip_dim: int = 512):
         super().__init__()
 
         # LayerNorms keep scales aligned across different spaces before concatenation
@@ -244,8 +238,8 @@ class PerModalityGate(nn.Module):
         return logits
 
 class MeridianModel(nn.Module):
-    def __init__(self, image_hout: int = 16, image_eout: int = 32, text_hout: int = 16, text_eout: int = 32, curv_init: float = 1.0, 
-        learn_curv: bool = True, entail_init: float = 1.0, learn_entail: bool = True):
+    def __init__(self, image_hout: int = 16, image_eout: int = 16, text_hout: int = 16, text_eout: int = 16, curv_init: float = 1.0, 
+        learn_curv: bool = True, entail_init: float = 0.01, learn_entail: bool = True):
         super().__init__()
 
         # Load Hugging Face Model and Processor
@@ -270,17 +264,16 @@ class MeridianModel(nn.Module):
 
         self._curv_minmax = {
             "max": math.log(curv_init * 10),  
-            "min": math.log(curv_init / 10), 
+            "min": math.log(curv_init / 8), 
         }
         
         # Temperature for Contrastive Loss
-        self.logit_scale_hyp  = nn.Parameter(torch.tensor(1.0 / 0.07).log())  # log(1/0.07), CLIP standard
         self.logit_scale_eucl = nn.Parameter(torch.tensor(1.0 / 0.07).log())
         
    
         # Make entailment weight learnable or fixed
         if learn_entail:
-            self.entail_weight = nn.Parameter(torch.tensor(entail_init))
+            self.entail_weight = nn.Parameter(torch.tensor(entail_init).log())
         else:
             self.register_buffer('entail_weight', torch.tensor(entail_init))
 
@@ -329,22 +322,13 @@ class MeridianModel(nn.Module):
         _curv = clamped_curv_log.exp()
         
         # Temperature scales are protected by gradient clipping hooks — no forward clamping needed
-        hyp_temp = torch.clamp(self.logit_scale_hyp, max = 4.6052).exp()
         eucl_temp = torch.clamp(self.logit_scale_eucl, max = 4.6052).exp()
 
         # Clamp Hyperbolic Alphas
         img_h_alpha = torch.clamp(self.hyp_image_head.log_alpha_img, max=0.0).exp()
         txt_h_alpha = torch.clamp(self.hyp_text_head.log_alpha_txt, max=0.0).exp()
-
-        img_e_alpha = torch.clamp(self.eucl_image_head.log_alpha_img, max=0.0).exp()
-        txt_e_alpha = torch.clamp(self.eucl_text_head.log_alpha_txt, max=0.0).exp()
-
-        #if isinstance(self.entail_weight, nn.Parameter):
-        #    _active_entail_weight = self.entail_weight
-        #else:
-        #    _active_entail_weight = self.entail_weight
-
-        _active_entail_weight = self.entail_weight
+        
+        _active_entail_weight = torch.clamp(self.entail_weight, min = -2.3, max = -1.6).exp()
 
         # Extract Hidden States from the CLIP Model
         with torch.no_grad():
@@ -388,7 +372,7 @@ class MeridianModel(nn.Module):
             gating_probs = F.softmax(combined_logits, dim = -1)  # Shape: [Batch, 2]   
             a, b = gating_probs.unbind(dim = -1)
 
-        alphas = [img_h_alpha, txt_h_alpha, img_e_alpha, txt_e_alpha]
+        alphas = [img_h_alpha, txt_h_alpha]
 
         return {
             "h_image": h_image,
@@ -399,7 +383,6 @@ class MeridianModel(nn.Module):
             "b": b,
             "curv": _curv,
             "scale_eucl": eucl_temp,
-            "scale_hyp": hyp_temp,
             "entail_weight": _active_entail_weight,
             "alphas": alphas
         }

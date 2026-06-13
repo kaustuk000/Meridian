@@ -49,11 +49,11 @@ class MeridianLoss(nn.Module):
         b: torch.Tensor,         
         curv: torch.Tensor, 
         scale_eucl: torch.Tensor,
-        scale_hyp: torch.Tensor,
         entail_weight: torch.Tensor,
         alphas: list[torch.Tensor] = None,
         rank: int = 0
     ):
+    
         """Calculates joint multi-space structural and alignment losses across batches."""
         # 1. ENFORCE FLOAT32 IMMEDIATELY AT THE ENTRY POINT
         # This completely guarantees numerical stability for hyperbolic math (cosh/sinh/distances)
@@ -69,7 +69,6 @@ class MeridianLoss(nn.Module):
         
         curv = curv.float()
         scale_eucl = scale_eucl.float()
-        scale_hyp = scale_hyp.float()
         entail_weight = entail_weight.float() if isinstance(entail_weight, torch.Tensor) else entail_weight
 
         B_local = h_image.size(0)
@@ -97,8 +96,9 @@ class MeridianLoss(nn.Module):
 
         # HYPERBOLIC BRANCH LOSSES
         # Row = local sample, Col = global gathered options -> Shape: (B_local, B_global)
-        hyp_logits_per_image = - scale_hyp * lorentz_distance(h_image, all_h_text, curv)
-        hyp_logits_per_text = - scale_hyp * lorentz_distance(h_text, all_h_image, curv)
+        with torch.autocast(device.type, dtype=torch.float32):
+            hyp_logits_per_image = - lorentz_distance(h_image, all_h_text, curv)
+            hyp_logits_per_text = - lorentz_distance(h_text, all_h_image, curv)
         
         hyp_loss_img = F.cross_entropy(hyp_logits_per_image, targets)
         hyp_loss_txt = F.cross_entropy(hyp_logits_per_text, targets)
@@ -138,7 +138,7 @@ class MeridianLoss(nn.Module):
         )
 
         if entail_weight > 0.0:
-            total_loss = total_loss + entailment_loss * entail_weight
+            total_loss = total_loss + (entailment_loss * entail_weight)
             
         return total_loss, {
             "loss/total": total_loss.item(),
