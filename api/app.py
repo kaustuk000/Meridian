@@ -70,7 +70,7 @@ model: Optional[MeridianModel] = None
 tokenizer: Optional[Tokenizer] = None
 engine: Optional[MeridianSearchEngine] = None
 
-CHECKPOINT_PATH = os.getenv("MERIDIAN_CHECKPOINT", "output/checkpoint_final.pt")
+CHECKPOINT_PATH = os.getenv("MERIDIAN_CHECKPOINT", "checkpoints/meridian_model/meridian_weights.pt")
 INDEX_PATH      = os.getenv("MERIDIAN_INDEX",      "meridian/data/cc3m_index.pt")
 CACHE_DIR       = os.getenv("MERIDIAN_CACHE_DIR",  "app_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -93,7 +93,6 @@ async def lifespan(app: FastAPI):
     try:
         ckpt = torch.load(CHECKPOINT_PATH, map_location="cpu", weights_only=False)
         state_dict = ckpt.get("model_state_dict", ckpt)
-        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
 
         def _infer_dim(prefix: str) -> int:
             for k, v in state_dict.items():

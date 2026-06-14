@@ -32,7 +32,6 @@ from app.inference import MeridianSearchEngine
 def load_meridian_model(checkpoint_path: str, device: torch.device):
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
-    state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
 
     def _find_dim(prefix: str) -> int:
         for k, v in state_dict.items():
