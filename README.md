@@ -14,6 +14,7 @@ Because the volume of hyperbolic space grows exponentially rather than polynomia
 ## Architecture
 
 ![Meridian Architecture](assets/Meridian%20Architecture.png)
+
 ## Key Features
 
 * **CLIP ViT-B/16 Foundation:** Leverages rich, pre-trained multimodal representations out-of-the-box before mapping to hyperbolic structures.
@@ -30,26 +31,6 @@ Because the volume of hyperbolic space grows exponentially rather than polynomia
 - **Hierarchical Multimodal Retrieval:** Organizes image-text data into semantic hierarchies for interpretable exploration and retrieval.
 - **Multimodal Search:** Supports text-to-image, image-to-image, and hybrid image+text retrieval.
 - **Interactive Visualization:** Generates navigable semantic trees for large-scale image collections.
-
----
-
-## Geometric Intuition
-
-In a standard Euclidean embedding space, broad concepts and specific attributes are forced onto the same flat plane, causing unrelated tokens to crowd and overlap near the edges. 
-
-Hyperbolic geometry resolves this by introducing an implicit hierarchical gradient:
-* **The Origin (Center):** General, overarching parent concepts (e.g., *Entity*, *Vehicle*, *Animal*) naturally gravitate toward the center of the disk.
-* **The Boundary (Edge):** Highly specific leaf-nodes (e.g., *Supersonic jet airplane*, *German shepherd puppy*) branch outwards along continuous paths toward the perimeter.
-
-The geodesic distance between two points on the Lorentz manifold is defined as:
-
-`d_L(x, y) = (1/√c) arcosh(-c ⟨x, y⟩_L)`
-
-where the Lorentzian inner product is:
-
-`⟨x, y⟩_L = -x₀y₀ + Σᵢ xᵢyᵢ`
-
-As embeddings approach the boundary (||u||, ||v|| → 1), the denominator shrinks, causing the distance to grow exponentially—giving the model infinite room to isolate dense clusters cleanly.
 
 ---
 
@@ -164,42 +145,75 @@ Meridian separates aircraft and ground vehicles into distinct semantic branches,
 
 **Key Observation:** Meridian significantly reduces cross-category mixing and produces cleaner semantic neighborhoods, resulting in more interpretable hierarchical structures.
 
+## Geometric Intuition
 
+In a standard Euclidean embedding space, broad concepts and specific attributes are forced onto the same flat plane, causing unrelated tokens to crowd and overlap near the edges. 
+
+Hyperbolic geometry resolves this by introducing an implicit hierarchical gradient:
+* **The Origin (Center):** General, overarching parent concepts (e.g., *Entity*, *Vehicle*, *Animal*) naturally gravitate toward the center of the disk.
+* **The Boundary (Edge):** Highly specific leaf-nodes (e.g., *Supersonic jet airplane*, *German shepherd puppy*) branch outwards along continuous paths toward the perimeter.
+
+The geodesic distance between two points on the Lorentz manifold is defined as:
+
+`d_L(x, y) = (1/√c) arcosh(-c ⟨x, y⟩_L)`
+
+where the Lorentzian inner product is:
+
+`⟨x, y⟩_L = -x₀y₀ + Σᵢ xᵢyᵢ`
+
+As embeddings approach the boundary (||u||, ||v|| → 1), the denominator shrinks, causing the distance to grow exponentially—giving the model infinite room to isolate dense clusters cleanly.
+
+---
 
 ## Installation & Setup
 
-This repository requires Python 3.12+ and utilizes `uv` for ultra-fast, reproducible dependency and environment management.
+This repository requires Python 3.12+ and utilizes `uv` for dependency management.
 
-### Prerequisites
+### Backend Setup
 
-- Python 3.12 or higher
-- CUDA 12.8+ (for GPU acceleration; CPU-only installation also supported)
-- `uv` package manager ([installation guide](https://docs.astral.sh/uv/getting-started/installation/))
+```bash
+git clone https://github.com/kaustuk000/Meridian.git
+cd Meridian
 
-### Installation Steps
+uv venv
+source .venv/bin/activate      # Windows: .venv\Scripts\activate
 
-1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/kaustuk000/Meridian.git
-   cd Meridian
-   ```
+uv sync
+```
 
-2. **Create a virtual environment using `uv`:**
-   ```bash
-   uv venv
-   source .venv/bin/activate  # On Windows: .venv\Scripts\Activate.ps1
-   ```
+### Frontend Setup
 
-3. **Install dependencies:**
-   ```bash
-   uv sync
-   ```
+The interactive hierarchy visualization frontend is located in `api/frontend` and uses Vite + React.
 
-4. **Download pre-trained checkpoints (optional):**
-   ```bash
-   uv run python -m scripts.download_models
-   ```
+```bash
+cd api/frontend
+npm install
+```
 
+### Run Frontend
+
+```bash
+cd api/frontend
+npm run dev
+```
+
+Default URL:
+
+```text
+http://localhost:5173
+```
+
+### Run Backend API
+
+```bash
+uvicorn api.app:app --reload --port 8000  
+```
+
+Default API URL:
+
+```text
+http://localhost:8000
+```
 ---
 
 ## Quick Start
@@ -217,6 +231,28 @@ uv run python -m scripts.train \
     --workers 4
 
 ```
+
+### Reference Training Run
+
+```bash
+uv run python -m scripts.train \
+    --batch-size 196 \
+    --workers 8 \
+    --warmup-steps 6000 \
+    --total-iterations 150000 \
+    --output-dir checkpoints/meridian_v1
+```
+
+Key configuration:
+
+- Dataset: CC3M (~1.51M surviving image-text pairs)
+- Training Steps: 150,000
+- Batch Size: 196
+- Warmup Steps: 6,000
+- DataLoader Workers: 8
+- CLIP ViT-B/16 encoders frozen during training
+- Learnable layer aggregation, projection heads, and adaptive gating
+
 
 ### Inference
 
@@ -264,56 +300,49 @@ print("Hyperbolic Image Embedding Shape:", h_image.shape)
 print("Hyperbolic Text Embedding Shape:", h_text.shape)
 ```
 
-### Evaluation
-
-Run evaluation on downstream tasks:
-
-```bash
-python scripts/evaluate.py \
-    --model-path meridian/checkpoints/meridian_v1 \
-    --eval-datasets imagenet zeroshot
-```
-
 ---
 
 ## Project Structure
 
 ```
 Meridian/
-├── api/                      # FastAPI inference server
-│   ├── app.py               # Application entry point
-│   ├── inference.py         # Inference pipeline
+├── api/
+│   ├── app.py            # backend endpoint
+│   ├── inference.py      # score calculation for retrival
+│   └── frontend/
+│       ├── src/
+│       ├── public/
+│       ├── package.json
+│       ├── vite.config.js
+│       └── ...
 ├── meridian/                # Core library
 │   ├── model.py            # Main Meridian model architecture
 │   ├── lorentz.py          # Hyperbolic geometry operations
 │   ├── losses.py           # Custom loss functions
 │   ├── optim.py            # Optimization utilities
 │   ├── tokenizer.py        # Text tokenization
-│   ├── data/               # Data loading utilities
-│   │   ├── cc3m.py        # CC3M dataloader
-|   |   ├── cc3m.tsv # CC3M Image-link tsv([download link](https://huggingface.co/datasets/yxchng/cc15m_yfcc15m/resolve/main/cc3m.tsv))
-|   |   ├──cc3m_smoke/
-|   |   |   ├── *_stats.json
-|   |   |   ├── *_paraquet
-|   |   |   └── *.tar
-|   |   ├── dataset_download.py # (use to download dataset with --dataset argument or use CLI)
-│   │   ├── transforms.py  # Image/text preprocessing
-│   │   └── evaluation.py  # Evaluation dataset loaders
-│   └── utils/              # Utility functions
-│       ├── checkpointing.py
-│       ├── distributed.py
-│       └── metrics.py
+│   └── data/               # Data loading utilities
+│       ├── cc3m.py        # CC3M dataloader
+|       ├── cc3m.tsv # CC3M Image-link tsv([download link](https://huggingface.co/datasets/yxchng/cc15m_yfcc15m/resolve/main/cc3m.tsv))
+|       ├──cc3m_smoke/
+|       |   ├── *_stats.json
+|       |   ├── *_paraquet
+|       |   └── *.tar
+|       ├── dataset_download.py # (use to download dataset with --dataset argument or use CLI)
+│       ├── transforms.py  # Image/text preprocessing
+│       └── evaluation.py  # Evaluation dataset loaders
+│   
+│       
+│       
+│       
 ├── scripts/                # Training and evaluation scripts
 │   ├── train.py           # Main training script
 │   ├── evaluate.py        # Evaluation script
 │   ├── visualize.py       # Visualization utilities
-│   └── download_models.py # Download pre-trained models
-├── configs/               # Configuration files
-│   ├── train_vit_b.py
-│   ├── eval_zsc.py
-│   └── eval_retrieval.py
-├── notebooks/             # Jupyter notebooks
-├── checkpoints/           # Model checkpoints(frozen **CLIP (ViT-B/16)**)
+│   └── download_models.py # Download pre-trained models  
+├── checkpoints/      
+|      ├── CLIP    # Vit-B/16 weights
+|      └── meridian_model/  # meridian final weights
 |── assets/
 └── README.md
 ```
