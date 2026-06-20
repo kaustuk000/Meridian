@@ -44,7 +44,6 @@ from meridian.data.transforms import (
     build_eval_transform,
     build_region_transform,
 )
-from meridian.data.tokenizer import tokenizer
 
 MAX_SEQ_LEN: int = 77  # CLIP text transformer context window
 
@@ -119,9 +118,6 @@ class VisualGenomeDataset(Dataset):
             f"from {n_images:,} images."
         )
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     def _get_image_path(self, image_id: int) -> Path:
         """
@@ -198,10 +194,6 @@ class VisualGenomeDataset(Dataset):
 
         return samples
 
-    # ------------------------------------------------------------------
-    # Dataset interface
-    # ------------------------------------------------------------------
-
     def __len__(self) -> int:
         return len(self.samples)
 
@@ -241,14 +233,6 @@ class VisualGenomeDataset(Dataset):
             "region":    self.region_transform(region_crop),  # (3, 224, 224)
             "text":      record["phrase"],
         }
-
-
-# ===========================================================================
-# Retrieval eval datasets
-# Adapted from MERU (Meta AI Research, Apache-2.0).
-# Changes vs MERU: default transform wired to build_eval_transform();
-# tensorflow-datasets classes removed (not needed for Meridian).
-# ===========================================================================
 
 class CocoCaptions(Dataset):
     """
@@ -343,8 +327,7 @@ class Flickr30kCaptions(CocoCaptions):
         split: str,
         transform: Optional[Callable] = None,
     ):
-        # Skip CocoCaptions.__init__ — different JSON structure.
-        # Call Dataset.__init__ directly to initialise PyTorch internals.
+    
         Dataset.__init__(self)
         self.root      = Path(root)
         self.split     = split
@@ -363,12 +346,6 @@ class Flickr30kCaptions(CocoCaptions):
             if ann["split"] == split
         ]
 
-
-# ===========================================================================
-# Smoke-test / local dev — flat file map-style dataset
-# No TAR dependency; works with the JSON / TSV produced by build_metadata_db.py
-# or any small hand-crafted metadata file.
-# ===========================================================================
 
 class ImageTextDataset(Dataset):
     """
@@ -395,7 +372,7 @@ class ImageTextDataset(Dataset):
         max_samples:   Optional[int] = None,
     ) -> None:
         self.image_root = Path(image_root)
-        # Use the new transforms API — no get_transforms() here.
+        # Use the new transforms API 
         self.transform  = (
             build_train_transform() if split == "train" else build_eval_transform()
         )
@@ -419,9 +396,8 @@ class ImageTextDataset(Dataset):
         return self.transform(img)
 
 
-# ---------------------------------------------------------------------------
+
 # Module-level helper — shared by ImageTextDataset and build_metadata_db.py
-# ---------------------------------------------------------------------------
 
 def _load_metadata(
     path: Path,
