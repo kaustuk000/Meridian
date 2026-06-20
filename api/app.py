@@ -1,5 +1,18 @@
 import io
 import os
+from pathlib import Path
+
+# REDIRECT HUGGINGFACE CACHE TO LOCAL PROJECT FOLDER
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+LOCAL_HF_CACHE = PROJECT_ROOT / "checkpoints" / "hf_cache"
+LOCAL_HF_CACHE.mkdir(parents=True, exist_ok=True)
+
+# Set the environment variable before importing any transformers/hf tools
+os.environ["HF_HOME"] = str(LOCAL_HF_CACHE)
+
+
+import io
+import os
 import json
 import logging
 import asyncio
@@ -8,7 +21,7 @@ import urllib.request
 from contextlib import asynccontextmanager
 from typing import Optional, List
 import uuid
-
+import time
 import numpy as np
 import torch
 
@@ -21,15 +34,18 @@ from PIL import Image, UnidentifiedImageError
 import scipy.spatial.distance as ssd
 from scipy.cluster.hierarchy import linkage, to_tree
 
-from meridian.model import MeridianModel
+from transformers import AutoModel
+
 from meridian.tokenizer import Tokenizer
 from meridian.lorentz import lorentz_distance
 from meridian.data.transforms import build_eval_transform
 from api.inference import MeridianSearchEngine
+from api.timing import timer, log_encode, log_request, log_hierarchy
 
-# ---------------------------------------------------------------------------
+
+
 # Logging
-# ---------------------------------------------------------------------------
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -37,9 +53,17 @@ logging.basicConfig(
 )
 log = logging.getLogger("meridian.api")
 
-# ---------------------------------------------------------------------------
-# Pydantic Schemas
-# ---------------------------------------------------------------------------
+
+
+# Config
+CACHE_DIR  = os.getenv("MERIDIAN_CACHE_DIR",  "app_cache")
+# Create cache dir at module load time so StaticFiles() below never crashes
+# even if the folder was deleted between runs.
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+
+# Pydantic schemas
 class QueryConfig(BaseModel):
     has_text: bool
     has_image: bool
@@ -62,37 +86,27 @@ class HealthResponse(BaseModel):
     device: str
     node_count: Optional[int] = None
 
-# ---------------------------------------------------------------------------
-# Global state
-# ---------------------------------------------------------------------------
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model: Optional[MeridianModel] = None
-tokenizer: Optional[Tokenizer] = None
-engine: Optional[MeridianSearchEngine] = None
 
-CHECKPOINT_PATH = os.getenv("MERIDIAN_CHECKPOINT", "checkpoints/meridian_model/meridian_weights.pt")
-INDEX_PATH      = os.getenv("MERIDIAN_INDEX",      "meridian/data/cc3m_index.pt")
-CACHE_DIR       = os.getenv("MERIDIAN_CACHE_DIR",  "app_cache")
-os.makedirs(CACHE_DIR, exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# Lifespan  (replaces deprecated @app.on_event)
-# ---------------------------------------------------------------------------
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Warm-up on startup; cleanup on shutdown."""
-    global model, tokenizer, engine
+# Service: model inference
 
-    # ── STARTUP ─────────────────────────────────────────────────────────────
-    log.info("Meridian API starting on device: %s", device)
+class InferenceService:
+    """Owns the MeridianModel and tokenizer; executes forward passes."""
 
-    for path, label in [(CHECKPOINT_PATH, "Checkpoint"), (INDEX_PATH, "Index")]:
-        if not os.path.exists(path):
-            raise RuntimeError(f"{label} not found: {path!r}")
+    def __init__(self, device: torch.device):
+            self.device = device
+            self.tokenizer = Tokenizer()
+            self.model = self._load_model()
 
-    try:
-        ckpt = torch.load(CHECKPOINT_PATH, map_location="cpu", weights_only=False)
-        state_dict = ckpt.get("model_state_dict", ckpt)
+
+    def _load_model(self) -> AutoModel:
+        # Hugging Face handles fetching the code, inferring dims from config.json,
+        # and loading the safetensors.
+        model = AutoModel.from_pretrained("kaustuk000/meridian", trust_remote_code=True)
+        model.to(self.device)
+        model.eval()
+        log.info("Hugging Face model loaded and set to eval mode.")
+        return model
 
         def _infer_dim(prefix: str) -> int:
             for k, v in state_dict.items():
@@ -109,7 +123,7 @@ async def lifespan(app: FastAPI):
             image_eout=_infer_dim("eucl_image_head.image_mlp."),
             text_hout =_infer_dim("hyp_text_head.text_mlp."),
             text_eout =_infer_dim("eucl_text_head.text_mlp."),
-        ).to(device)
+        ).to(self.device)
 
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if missing:
@@ -119,12 +133,320 @@ async def lifespan(app: FastAPI):
 
         model.eval()
         log.info("Model loaded and set to eval mode.")
+        return model
 
-        engine    = MeridianSearchEngine(INDEX_PATH)
-        tokenizer = Tokenizer()
+    def _tokenize(self, text: str):
+        tokens  = self.tokenizer([text])[0]
+        max_len = 77
+        input_ids      = torch.zeros(1, max_len, dtype=torch.long, device=self.device)
+        attention_mask = torch.zeros(1, max_len, dtype=torch.long, device=self.device)
+        seq = tokens[:max_len].long().to(self.device)
+        n   = len(seq)
+        input_ids[0, :n]      = seq
+        attention_mask[0, :n] = 1
+        eos_indices = torch.tensor([n - 1], dtype=torch.long, device=self.device)
+        return input_ids, attention_mask, eos_indices
+
+    # Public
+
+    def run(self, pixel_values: torch.Tensor, text: str) -> dict:
+        input_ids, attention_mask, eos_indices = self._tokenize(text)
+        try:
+            with torch.no_grad():
+                with timer() as t_enc:
+                    img_out = self.model.encode_image(pixel_values)
+                    txt_out = self.model.encode_text(input_ids, attention_mask, eos_indices)
+                    if self.device.type == "cuda":
+                        torch.cuda.synchronize()
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            raise HTTPException(503, "GPU memory exhausted — retry after a moment.")
+
+        log_encode(t_enc["ms"])
+
+        out = {}
+        out["h_image"]    = img_out["h_image"].to(self.device)
+        out["e_image"]    = img_out["e_image"].to(self.device)
+        out["a_img"]      = img_out["a_img"].to(self.device)
+        out["b_img"]      = img_out["b_img"].to(self.device)
+        out["h_text"]     = txt_out["h_text"].to(self.device)
+        out["e_text"]     = txt_out["e_text"].to(self.device)
+        out["a_txt"]      = txt_out["a_txt"].to(self.device)
+        out["b_txt"]      = txt_out["b_txt"].to(self.device)
+        out["curv"]       = img_out["curv"]
+        out["scale_hyp"]  = img_out["scale_hyp"]
+        out["scale_eucl"] = img_out["scale_eucl"]
+        return out
+
+    def dummy_pixels(self) -> torch.Tensor:
+        return torch.zeros(1, 3, 224, 224, device=self.device)
+
+
+
+# Service: image caching
+
+class CacheService:
+    """Downloads and persists images; returns /cache/<filename> URLs.
+
+    On download failure returns a placeholder so the search result still
+    shows (with caption) rather than being silently dropped.
+    """
+
+    _PLACEHOLDER_NAME = "_placeholder.jpg"
+
+    def __init__(self, cache_dir: str):
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+        self._placeholder_path = os.path.join(cache_dir, self._PLACEHOLDER_NAME)
+        self._ensure_placeholder()
+
+    # Internal 
+
+    def _ensure_placeholder(self) -> None:
+        """Write a dark grey placeholder JPEG once."""
+        if not os.path.exists(self._placeholder_path):
+            img = Image.new("RGB", (400, 300), (28, 28, 36))
+            img.save(self._placeholder_path, format="JPEG", quality=100)
+            log.info("Placeholder created → %s", self._placeholder_path)
+
+    def _content_hash(self, url: str) -> str:
+        return hashlib.md5(url.encode()).hexdigest()[:14]
+
+    @staticmethod  
+    def _download_sync(url: str, filepath: str) -> bool:  
+        """Download one URL, convert to JPEG, and persist to filepath.
+
+        Returns True only if a valid image was saved.
+        Uses load() instead of verify() — verify() is stricter than browsers
+        and incorrectly rejects many valid JPEGs with minor quirks.
+        Retries once on transient failures.
+        """
+        if os.path.exists(filepath):
+            return True
+
+        for attempt in range(1, 3):
+            try:
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": "Mozilla/5.0 Meridian/2.0"}
+                )
+                with urllib.request.urlopen(req, timeout=8.0) as resp:
+                    ct = resp.headers.get("Content-Type", "")
+                    
+                    if any(t in ct for t in ("text/html", "text/xml", "application/xml")):
+                        log.warning(
+                            "Non-image Content-Type %r (attempt %d): %s", ct, attempt, url
+                        )
+                        continue 
+
+                    data = resp.read()
+
+                if not data:
+                    log.warning("Empty response (attempt %d): %s", attempt, url)
+                    continue
+
+                try:
+                    with Image.open(io.BytesIO(data)) as img:
+                        img.load()
+                        if img.width < 64 or img.height < 64:
+                            log.warning(
+                                "Image too small (%dx%d), skipping: %s",
+                                img.width, img.height, url,
+                            )
+                            return False
+                        img_rgb = img.convert("RGB")
+                    img_rgb.save(filepath, format="JPEG", quality=85, optimize=True)
+                except Exception as img_exc:
+                    log.warning(
+                        "PIL decode/save failed (attempt %d) [%s]: %s",
+                        attempt, url, img_exc,
+                    )
+                    # Clean up any partial write before retrying
+                    if os.path.exists(filepath):
+                        try:
+                            os.remove(filepath)
+                        except OSError:
+                            pass
+                    continue
+
+                log.info( 
+                    "Cached %s ← %s (raw %d B)",
+                    os.path.basename(filepath), url[:72], len(data),
+                )
+                return True
+
+            except Exception as exc:
+                log.warning("Download attempt %d/2 failed [%s]: %s", attempt, url, exc)
+
+        log.warning("All download attempts failed, using placeholder: %s", url)
+        return False
+
+    # Public 
+
+    async def cache_url(self, url: str, idx: int) -> str:
+        """Return a local /cache/ path — real image or placeholder, never None."""
+        if not url:
+            return f"/cache/{self._PLACEHOLDER_NAME}"
+
+        h        = self._content_hash(url)
+        filepath = os.path.join(self.cache_dir, f"img_{idx}_{h}.jpg")
+        success  = await asyncio.to_thread(self._download_sync, url, filepath)
+
+        if success:
+            return f"/cache/{os.path.basename(filepath)}"
+        return f"/cache/{self._PLACEHOLDER_NAME}"
+
+    async def cache_upload(self, raw: bytes, stem: str, idx: int) -> Optional[str]:
+        """Persist an uploaded image; returns None only if raw bytes are unreadable."""
+        if not raw:
+            return None
+        try:
+            with Image.open(io.BytesIO(raw)) as img:
+                img.load()
+                img_rgb = img.convert("RGB")
+        except Exception as exc:
+            log.warning("Upload decode failed [%s_%d]: %s", stem, idx, exc)
+            return None
+
+        safe_stem = "".join(
+            ch if ch.isalnum() or ch in ("-", "_") else "_"
+            for ch in (stem or "img")
+        )[:40] or "img"
+        filename = f"{safe_stem}_{idx}_{uuid.uuid4().hex[:10]}.jpg"
+        filepath = os.path.join(self.cache_dir, filename)
+        try:
+            img_rgb.save(filepath, format="JPEG", quality=95, optimize=True)
+            return f"/cache/{filename}"
+        except Exception as exc:
+            log.warning("Failed to save upload [%s]: %s", filename, exc)
+            if os.path.exists(filepath):
+                try:
+                    os.remove(filepath)
+                except OSError:
+                    pass
+            return None
+
+
+# Service: hierarchy tree building
+class HierarchyService:
+    """Computes Lorentz distance matrices, runs linkage, renders 3-D HTML."""
+
+    def __init__(self, cache_dir: str, device: torch.device):
+        self.cache_dir = cache_dir
+        self.device    = device
+
+    def _dist_matrix(
+        self, features: list[torch.Tensor], curv: torch.Tensor
+    ) -> np.ndarray:
+        """Pairwise Lorentz distances — raw positive distances for linkage()."""
+        n   = len(features)
+        mat = np.zeros((n, n), dtype=np.float64)
+        h   = torch.stack(features)
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = lorentz_distance(
+                    h[i].unsqueeze(0), h[j].unsqueeze(0), curv=curv
+                ).item()
+                mat[i, j] = mat[j, i] = max(0.0, d)
+        return mat
+
+    @staticmethod
+    def _build_tree_json(node, leaf_items: list) -> dict:
+        if node.is_leaf():
+            item = leaf_items[node.id]
+            if isinstance(item, dict):
+                payload = {"name": str(item.get("name", ""))}
+                if image_url := item.get("image_url"):
+                    payload["image_url"] = image_url
+                return payload
+            return {"name": str(item)}
+        return {
+            "name": f"Node_{node.id}",
+            "children": [
+                HierarchyService._build_tree_json(node.left,  leaf_items),
+                HierarchyService._build_tree_json(node.right, leaf_items),
+            ],
+        }
+
+    def _write_html(self, tree_dict: dict, out_path: str) -> None:
+        html = _HTML_TEMPLATE.replace(
+            "__TREE_DATA__", json.dumps(tree_dict, ensure_ascii=False)
+        )
+        with open(out_path, "w", encoding="utf-8") as fh:
+            fh.write(html)
+        log.info("3-D tree written → %s (%d bytes)", out_path, len(html))
+
+    def build_response(
+        self,
+        features: list[torch.Tensor],
+        labels: list,
+        curv: torch.Tensor,
+        request: Request,
+        filename: str,
+    ) -> dict:
+        with timer() as t_dist:
+            mat = self._dist_matrix(features, curv)
+
+        with timer() as t_link:
+            condensed = ssd.squareform(mat)
+            Z         = linkage(condensed, method="average")
+            root, _   = to_tree(Z, rd=True)
+            tree_dict = self._build_tree_json(root, labels)
+
+        with timer() as t_render:
+            out_path = os.path.join(self.cache_dir, filename)
+            self._write_html(tree_dict, out_path)
+
+        log_hierarchy(
+            n_items=len(features),
+            dist_ms=t_dist["ms"],
+            linkage_ms=t_link["ms"],
+            render_ms=t_render["ms"],
+        )
+
+        base = str(request.base_url).rstrip("/")
+        return {
+            "status":   "success",
+            "message":  "Open the URL below to explore your 3-D semantic tree.",
+            "tree_url": f"{base}/cache/{filename}",
+        }
+
+
+
+# Global service instances (populated in lifespan)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+inference_svc:  Optional[InferenceService]     = None
+search_engine:  Optional[MeridianSearchEngine] = None
+cache_svc:      Optional[CacheService]         = None
+hierarchy_svc:  Optional[HierarchyService]     = None
+
+
+# Lifespan
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global inference_svc, search_engine, cache_svc, hierarchy_svc
+
+    log.info("Meridian API starting on device: %s", device)
+
+    try:
+        # 1. Initialize InferenceService (Downloads HF Model automatically)
+        inference_svc = InferenceService(device)
+        
+        # 2. Download/Load HF Index directly through the loaded model
+        log.info("Downloading/Loading Hugging Face index...")
+        hf_index = inference_svc.model.load_index("kaustuk000/meridian")
+        
+        # 3. Pass the fetched HF index dictionary to the Search Engine
+        search_engine = MeridianSearchEngine(hf_index, device)
+        
+        # 4. Initialize cache and hierarchy services
+        cache_svc     = CacheService(CACHE_DIR)
+        hierarchy_svc = HierarchyService(CACHE_DIR, device)
+
         log.info(
             "Engine ready. Index size: %d items.",
-            len(engine.index.get("captions", [])),
+            len(search_engine.index.get("captions", [])),
         )
 
         if device.type == "cuda":
@@ -133,21 +455,18 @@ async def lifespan(app: FastAPI):
                 "CUDA memory: %.1f MB allocated.",
                 torch.cuda.memory_allocated() / 1e6,
             )
-
     except Exception:
         log.exception("Fatal error during startup.")
         raise
 
-    yield  # ── application runs here ──────────────────────────────────────
+    yield
 
-    # ── SHUTDOWN ────────────────────────────────────────────────────────────
     log.info("Shutting down Meridian API.")
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-# ---------------------------------------------------------------------------
+
 # App
-# ---------------------------------------------------------------------------
 app = FastAPI(
     title="Meridian Multi-Space Search API",
     description=(
@@ -165,124 +484,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# ---------------------------------------------------------------------------
+
+
+
 # Global exception handler
-# ---------------------------------------------------------------------------
 @app.exception_handler(Exception)
 async def _global_exc(request: Request, exc: Exception):
-    log.error("Unhandled exception [%s %s]: %s", request.method, request.url, exc, exc_info=True)
+    log.error(
+        "Unhandled exception [%s %s]: %s", request.method, request.url, exc, exc_info=True
+    )
     return JSONResponse(
         status_code=500,
         content={"detail": "Internal server error — check server logs."},
     )
 
-# ---------------------------------------------------------------------------
-# Core inference helpers
-# ---------------------------------------------------------------------------
-def _encode_text(text: str):
-    """Tokenise & pad one text string → (input_ids, attention_mask, eos_indices)."""
-    tokens   = tokenizer([text])[0]
-    max_len  = 77
-    input_ids      = torch.zeros(1, max_len, dtype=torch.long, device=device)
-    attention_mask = torch.zeros(1, max_len, dtype=torch.long, device=device)
-    seq = tokens[:max_len].long().to(device)
-    n   = len(seq)
-    input_ids[0, :n]      = seq
-    attention_mask[0, :n] = 1
-    eos_indices = torch.tensor([n - 1], dtype=torch.long, device=device)
-    return input_ids, attention_mask, eos_indices
 
 
-def _run_model(pixel_values: torch.Tensor, text: str) -> dict:
-    """Single forward pass; raises HTTPException(503) on OOM."""
-    input_ids, attention_mask, eos_indices = _encode_text(text)
-    try:
-        with torch.no_grad():
-            outputs = model(
-                pixel_values=pixel_values,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                eos_indices=eos_indices,
-            )
-    except torch.cuda.OutOfMemoryError:
-        torch.cuda.empty_cache()
-        raise HTTPException(
-            status_code=503,
-            detail="GPU memory exhausted — retry after a moment.",
-        )
-    return {
-        k: v.to(device) if isinstance(v, torch.Tensor) else v
-        for k, v in outputs.items()
-    }
-
-# ---------------------------------------------------------------------------
-# Image helpers
-# ---------------------------------------------------------------------------
-def _content_hash(url: str) -> str:
-    return hashlib.md5(url.encode()).hexdigest()[:14]
-
-
-def _download_sync(url: str, filepath: str) -> bool:
-    if os.path.exists(filepath):
-        return True
-    try:
-        req = urllib.request.Request(
-            url, headers={"User-Agent": "Mozilla/5.0 Meridian/2.0"}
-        )
-        with urllib.request.urlopen(req, timeout=3.0) as resp:
-            ct = resp.headers.get("Content-Type", "")
-            if any(t in ct for t in ("text/html", "text/xml", "application/xml")):
-                return False
-            data = resp.read()
-        # Validate it's actually an image before writing
-        Image.open(io.BytesIO(data)).verify()
-        with open(filepath, "wb") as f:
-            f.write(data)
-        return True
-    except Exception as exc:
-        log.debug("Download failed [%s]: %s", url, exc)
-        if os.path.exists(filepath):
-            try:
-                os.remove(filepath)
-            except OSError:
-                pass
-        return False
-
-
-async def _cache_image(url: str, idx: int) -> Optional[str]:
-    if not url:
-        return None
-    h        = _content_hash(url)
-    filepath = os.path.join(CACHE_DIR, f"img_{idx}_{h}.jpg")
-    success  = await asyncio.to_thread(_download_sync, url, filepath)
-    return f"/cache/{os.path.basename(filepath)}" if success else None
-
-
-async def _cache_uploaded_image(raw: bytes, stem: str, idx: int) -> Optional[str]:
-    """Persist an uploaded image to CACHE_DIR and return a cache URL."""
-    if not raw:
-        return None
-    try:
-        img = Image.open(io.BytesIO(raw)).convert("RGB")
-    except Exception as exc:
-        log.debug("Uploaded image decode failed [%s_%d]: %s", stem, idx, exc)
-        return None
-
-    safe_stem = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in (stem or "img"))[:40] or "img"
-    filename = f"{safe_stem}_{idx}_{uuid.uuid4().hex[:10]}.jpg"
-    filepath = os.path.join(CACHE_DIR, filename)
-    try:
-        img.save(filepath, format="JPEG", quality=95, optimize=True)
-        return f"/cache/{filename}"
-    except Exception as exc:
-        log.debug("Failed to cache uploaded image [%s]: %s", filename, exc)
-        if os.path.exists(filepath):
-            try:
-                os.remove(filepath)
-            except OSError:
-                pass
-        return None
-
+# Shared helpers (stateless, no class needed)
 
 def _fetch_pil_from_url(url: str) -> Image.Image:
     try:
@@ -298,14 +516,205 @@ def _fetch_pil_from_url(url: str) -> Image.Image:
 
 
 def _safe_index_get(collection: list, idx: int, fallback=""):
-    """Bounds-safe list access."""
     if not collection or idx < 0 or idx >= len(collection):
         return fallback
     return collection[idx]
 
-# ---------------------------------------------------------------------------
-# 3-D Hierarchy HTML generator
-# ---------------------------------------------------------------------------
+
+# Routes
+
+@app.get("/")
+def root():
+    return {
+        "service": "Meridian Multi-Space Search API v2",
+        "docs":    "/docs",
+        "health":  "/healthz",
+    }
+
+
+@app.get("/healthz", response_model=HealthResponse)
+def health():
+    return HealthResponse(
+        status      = "ok" if inference_svc is not None and search_engine is not None else "degraded",
+        model_loaded= inference_svc is not None,
+        index_loaded= search_engine is not None,
+        device      = str(device),
+        node_count  = len(search_engine.index.get("captions", [])) if search_engine else None,
+    )
+
+
+@app.post("/search", response_model=SearchResponse)
+async def search(
+    text_query: Optional[str]        = Form(None),
+    image_file: Optional[UploadFile] = File(None),
+    image_url:  Optional[HttpUrl]    = Form(None),
+    topk:       int                  = Form(9, ge=1, le=50),
+):
+    has_text  = bool(text_query and text_query.strip())
+    has_image = bool(image_file or image_url)
+
+    if not has_text and not has_image:
+        raise HTTPException(400, "Provide at least one modality (text or image).")
+    if image_file and image_url:
+        raise HTTPException(400, "Provide image_file or image_url — not both.")
+
+    # Build pixel tensor 
+    if has_image:
+        try:
+            if image_file:
+                raw     = await image_file.read()
+                img_pil = Image.open(io.BytesIO(raw)).convert("RGB")
+            else:
+                img_pil = await asyncio.to_thread(_fetch_pil_from_url, str(image_url))
+            pixel_values = build_eval_transform()(img_pil).unsqueeze(0).to(device)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        except UnidentifiedImageError:
+            raise HTTPException(415, "File could not be decoded as an image.")
+    else:
+        pixel_values = inference_svc.dummy_pixels()
+
+    # Forward pass
+    with timer() as t_enc:
+        query_text = text_query if has_text else "a photo"
+        outputs    = inference_svc.run(pixel_values, query_text)
+
+    # Search 
+    with timer() as t_search:
+        try:
+            candidate_pool = min(topk * 2, 200)
+            results = search_engine.search(
+                outputs,
+                query_has_text=has_text,
+                query_has_image=has_image,
+                topk=candidate_pool,
+            )
+        except Exception as exc:
+            log.exception("Search engine error")
+            raise HTTPException(500, f"Search engine error: {exc}")
+
+    # Cache result images concurrently 
+    with timer() as t_cache:
+        captions    = search_engine.index.get("captions", [])
+        raw_urls    = search_engine.index.get("urls",     [])
+        dl_tasks    = [cache_svc.cache_url(_safe_index_get(raw_urls, m["id"]), m["id"]) for m in results]
+        local_paths = await asyncio.gather(*dl_tasks)
+
+    log_request(
+        route="/search",
+        encode_ms=t_enc["ms"],
+        search_ms=t_search["ms"],
+        cache_ms=t_cache["ms"],
+        total_ms=t_enc["ms"] + t_search["ms"] + t_cache["ms"],
+    )
+
+    matches: list[MatchItem] = []
+    for match, lp in zip(results, local_paths):
+        matches.append(MatchItem(
+            id      = match["id"],
+            score   = float(match["score"]),
+            caption = _safe_index_get(captions, match["id"], fallback=""),
+            url     = lp,
+        ))
+        if len(matches) == topk:
+            break
+
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    return SearchResponse(
+        query_configuration=QueryConfig(has_text=has_text, has_image=has_image, topk=topk),
+        matches=matches,
+    )
+
+
+@app.post("/hierarchy/text")
+async def hierarchy_text(
+    request: Request,
+    terms:   str = Form(..., description="Comma-separated list of concept terms (≥ 2)."),
+):
+    term_list = [t.strip() for t in terms.split(",") if t.strip()]
+    if len(term_list) < 2:
+        raise HTTPException(400, "Provide at least 2 comma-separated terms.")
+    if len(term_list) > 2000:
+        raise HTTPException(400, "Maximum 2000 terms per request.")
+
+    dummy_px     = inference_svc.dummy_pixels()
+    features:    list[torch.Tensor] = []
+    valid_terms: list[str]          = []
+    failed:      list[str]          = []
+    curv:        Optional[torch.Tensor] = None
+
+    for term in term_list:
+        try:
+            out = inference_svc.run(dummy_px, term)
+            features.append(out["h_text"].squeeze(0))
+            valid_terms.append(term)
+            if curv is None:
+                curv = out["curv"]
+        except HTTPException:
+            raise
+        except Exception as exc:
+            log.warning("Failed to encode term %r: %s", term, exc)
+            failed.append(term)
+
+    if len(features) < 2:
+        raise HTTPException(422, f"Could not encode enough terms. Failed: {failed}")
+
+    resp = hierarchy_svc.build_response(
+        features, valid_terms, curv,
+        request, f"tree_text_{uuid.uuid4().hex}.html",
+    )
+    if failed:
+        resp["skipped_terms"] = failed
+    return resp
+
+
+@app.post("/hierarchy/images")
+async def hierarchy_images(
+    request:      Request,
+    files:        List[UploadFile] = File(...),
+    use_captions: bool             = Form(False),
+):
+    if len(files) < 2:
+        raise HTTPException(400, "Upload at least 2 images.")
+    if len(files) > 1000:
+        raise HTTPException(400, "Maximum 1000 images per request.")
+
+    features: list[torch.Tensor] = []
+    payloads: list[dict]         = []
+    curv:     Optional[torch.Tensor] = None
+
+    for idx, file in enumerate(files):
+        try:
+            raw     = await file.read()
+            img_pil = Image.open(io.BytesIO(raw)).convert("RGB")
+            pv      = build_eval_transform()(img_pil).unsqueeze(0).to(device)
+            out     = inference_svc.run(pv, "a photo")
+            features.append(out["h_image"].squeeze(0))
+            if curv is None:
+                curv = out["curv"]
+
+            stem      = os.path.splitext(file.filename or f"img_{idx}")[0]
+            image_url = await cache_svc.cache_upload(raw, stem, idx)
+            payloads.append({"name": stem, "image_url": image_url})
+        except HTTPException:
+            raise
+        except Exception as exc:
+            log.warning("Could not process %r: %s", file.filename, exc)
+
+    if len(features) < 2:
+        raise HTTPException(422, "Could not process enough valid images (need ≥ 2).")
+
+    return hierarchy_svc.build_response(
+        features, payloads, curv,
+        request, f"tree_images_{uuid.uuid4().hex}.html",
+    )
+
+
+
+# 3-D Hierarchy HTML template
+
 _HTML_TEMPLATE = """\
 <!DOCTYPE html>
 <html lang="en">
@@ -644,268 +1053,3 @@ setTimeout(()=>{fitView();document.getElementById('loader').style.display='none'
 </body>
 </html>
 """
-
-
-def generate_interactive_html(tree_data: dict, output_file: str) -> str:
-    """
-    Write a self-contained 3-D interactive tree HTML file.
-
-    The Three.js scene includes:
-      • Radial dendrogram layout (depth → Y, leaves on circles in XZ)
-      • Depth-coloured glowing nodes with breathing animation
-      • S-curve bezier edges with additive blending
-      • Translucent orbital rings per depth level
-      • Sprite labels that always face the camera
-      • Star field + nebula atmosphere
-      • Manual orbit controls (rotate / zoom / pan + touch)
-      • Raycaster hover tooltip with crosshair
-    """
-    html = _HTML_TEMPLATE.replace(
-        "__TREE_DATA__", json.dumps(tree_data, ensure_ascii=False)
-    )
-    with open(output_file, "w", encoding="utf-8") as fh:
-        fh.write(html)
-    log.info("3-D tree written → %s  (%d bytes)", output_file, len(html))
-    return output_file
-
-# ---------------------------------------------------------------------------
-# Hierarchy helpers  (shared by /hierarchy/text and /hierarchy/images)
-# ---------------------------------------------------------------------------
-def _build_d3_tree_json(node, leaf_items: list) -> dict:
-    if node.is_leaf():
-        item = leaf_items[node.id]
-        if isinstance(item, dict):
-            payload = {"name": str(item.get("name", ""))}
-            image_url = item.get("image_url")
-            if image_url:
-                payload["image_url"] = image_url
-            return payload
-        return {"name": str(item)}
-    return {
-        "name": f"Node_{node.id}",
-        "children": [
-            _build_d3_tree_json(node.left,  leaf_items),
-            _build_d3_tree_json(node.right, leaf_items),
-        ],
-    }
-
-
-def _compute_lorentz_dist_matrix(
-    features: list, curv: torch.Tensor
-) -> np.ndarray:
-    n = len(features)
-    mat = np.zeros((n, n), dtype=np.float64)
-    h   = torch.stack(features)
-    for i in range(n):
-        for j in range(i + 1, n):
-            d = lorentz_distance(
-                h[i].unsqueeze(0), h[j].unsqueeze(0), curv=curv
-            ).item()
-            mat[i, j] = mat[j, i] = max(0.0, d)
-    return mat
-
-
-def _tree_html_response(
-    features: list[torch.Tensor],
-    labels: list[str],
-    request: Request,
-    filename: str,
-) -> dict:
-    """Build hierarchy HTML and return URL dict."""
-    curv = torch.tensor(1.0, device=device)
-    mat  = _compute_lorentz_dist_matrix(features, curv)
-
-    condensed = ssd.squareform(mat)
-    Z         = linkage(condensed, method="average")
-    root, _   = to_tree(Z, rd=True)
-    tree_dict = _build_d3_tree_json(root, labels)
-
-    out_path = os.path.join(CACHE_DIR, filename)
-    generate_interactive_html(tree_dict, out_path)
-
-    base = str(request.base_url).rstrip("/")
-    return {
-        "status":  "success",
-        "message": "Open the URL below to explore your 3-D semantic tree.",
-        "tree_url": f"{base}/cache/{filename}",
-    }
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
-@app.get("/")
-def root():
-    return {
-        "service": "Meridian Multi-Space Search API v2",
-        "docs":    "/docs",
-        "health":  "/healthz",
-    }
-
-
-@app.get("/healthz", response_model=HealthResponse)
-def health():
-    return HealthResponse(
-        status      = "ok"    if model is not None and engine is not None else "degraded",
-        model_loaded= model is not None,
-        index_loaded= engine is not None,
-        device      = str(device),
-        node_count  = len(engine.index.get("captions", [])) if engine else None,
-    )
-
-
-@app.post("/search", response_model=SearchResponse)
-async def search(
-    text_query: Optional[str]      = Form(None),
-    image_file: Optional[UploadFile] = File(None),
-    image_url:  Optional[HttpUrl]  = Form(None),
-    topk:       int                = Form(9, ge=1, le=50),
-):
-    has_text  = bool(text_query and text_query.strip())
-    has_image = bool(image_file or image_url)
-
-    if not has_text and not has_image:
-        raise HTTPException(400, "Provide at least one modality (text or image).")
-    if image_file and image_url:
-        raise HTTPException(400, "Provide image_file or image_url — not both.")
-
-    # ── Build pixel tensor ─────────────────────────────────────────────────
-    if has_image:
-        try:
-            if image_file:
-                raw     = await image_file.read()
-                img_pil = Image.open(io.BytesIO(raw)).convert("RGB")
-            else:
-                img_pil = await asyncio.to_thread(_fetch_pil_from_url, str(image_url))
-            pixel_values = build_eval_transform()(img_pil).unsqueeze(0).to(device)
-        except ValueError as exc:
-            raise HTTPException(400, str(exc))
-        except UnidentifiedImageError:
-            raise HTTPException(415, "File could not be decoded as an image.")
-    else:
-        pixel_values = torch.zeros(1, 3, 224, 224, device=device)
-
-    # ── Forward pass ──────────────────────────────────────────────────────
-    query_text = text_query if has_text else "a photo"
-    outputs    = _run_model(pixel_values, query_text)
-
-    # ── Search ────────────────────────────────────────────────────────────
-    try:
-        candidate_pool = min(topk * 4, 200)
-        results = engine.search(
-            outputs,
-            query_has_text=has_text,
-            query_has_image=has_image,
-            topk=candidate_pool,
-        )
-    except Exception as exc:
-        log.exception("Search engine error")
-        raise HTTPException(500, f"Search engine error: {exc}")
-
-    # ── Cache images concurrently ─────────────────────────────────────────
-    captions   = engine.index.get("captions", [])
-    raw_urls   = engine.index.get("urls",     [])
-    dl_tasks   = [_cache_image(_safe_index_get(raw_urls, m["id"]), m["id"]) for m in results]
-    local_paths = await asyncio.gather(*dl_tasks)
-
-    matches: list[MatchItem] = []
-    for match, lp in zip(results, local_paths):
-        if lp is None:
-            continue
-        matches.append(MatchItem(
-            id      = match["id"],
-            score   = float(match["score"]),
-            caption = _safe_index_get(captions, match["id"], fallback=""),
-            url     = lp,
-        ))
-        if len(matches) == topk:
-            break
-
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-    return SearchResponse(
-        query_configuration=QueryConfig(has_text=has_text, has_image=has_image, topk=topk),
-        matches=matches,
-    )
-
-
-@app.post("/hierarchy/text")
-async def hierarchy_text(
-    request: Request,
-    terms:   str = Form(..., description="Comma-separated list of concept terms (≥ 2)."),
-):
-    """Embed text concepts with the hyperbolic head and render a 3-D semantic tree."""
-    term_list = [t.strip() for t in terms.split(",") if t.strip()]
-    if len(term_list) < 2:
-        raise HTTPException(400, "Provide at least 2 comma-separated terms.")
-    if len(term_list) > 2000:
-        raise HTTPException(400, "Maximum 2000 terms per request.")
-
-    dummy_px = torch.zeros(1, 3, 224, 224, device=device)
-    features: list[torch.Tensor] = []
-    failed:   list[str]          = []
-
-    for term in term_list:
-        try:
-            out = _run_model(dummy_px, term)
-            features.append(out["h_text"].squeeze(0))
-        except HTTPException:
-            raise
-        except Exception as exc:
-            log.warning("Failed to encode term %r: %s", term, exc)
-            failed.append(term)
-
-    valid_terms = [t for t in term_list if t not in failed]
-    if len(features) < 2:
-        raise HTTPException(422, f"Could not encode enough terms. Failed: {failed}")
-
-    
-    resp = _tree_html_response(features,valid_terms,request,f"tree_text_{uuid.uuid4().hex}.html")
-    if failed:
-        resp["skipped_terms"] = failed
-    return resp
-
-
-@app.post("/hierarchy/images")
-async def hierarchy_images(
-    request: Request,
-    files: List[UploadFile] = File(...),
-    use_captions: bool = Form(False)
-):
-    """Embed images with the hyperbolic head and render a 3-D semantic tree."""
-    if len(files) < 2:
-        raise HTTPException(400, "Upload at least 2 images.")
-    if len(files) > 1000:
-        raise HTTPException(400, "Maximum 1000 images per request.")
-
-    features: list[torch.Tensor] = []
-    payloads: list[dict] = []
-
-    for idx, file in enumerate(files):
-        try:
-            raw = await file.read()
-            img_pil = Image.open(io.BytesIO(raw)).convert("RGB")
-            pv = build_eval_transform()(img_pil).unsqueeze(0).to(device)
-            out = _run_model(pv, "a photo")
-            features.append(out["h_image"].squeeze(0))
-
-            stem = os.path.splitext(file.filename or f"img_{idx}")[0]
-            image_url = await _cache_uploaded_image(raw, stem, idx)
-            payloads.append({
-                "name": stem,
-                "image_url": image_url,
-            })
-        except HTTPException:
-            raise
-        except Exception as exc:
-            log.warning("Could not process %r: %s", file.filename, exc)
-
-    if len(features) < 2:
-        raise HTTPException(422, "Could not process enough valid images (need ≥ 2).")
-
-    return _tree_html_response(
-        features,
-        payloads,
-        request,
-        f"tree_images_{uuid.uuid4().hex}.html"
-    )
