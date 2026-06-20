@@ -111,9 +111,9 @@ def main():
     parser = argparse.ArgumentParser(description="Build Meridian Index using native WebDataset streaming pipeline.")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained checkpoint.")
     parser.add_argument("--tarfiles-dir", default="meridian/data/cc3m_smoke", help="Directory with CC3M TAR shards.")
-    parser.add_argument("--output-index", default="meridian/data/cc3m_index.pt", help="Where to save the index file.")
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--output-index", default="meridian/data/index/cc3m_index_32.pt", help="Where to save the index file.")
+    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--workers", type=int, default=12)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -144,11 +144,11 @@ def main():
     )
 
     index_data = {
-        "h_image": [], "e_image": [],
+        "h_image": [],"e_image": [],
         "h_text": [], "e_text": [],
-        "a": [], "b": [],
-        "captions": [],
-        "urls": []
+        "a_image": [], "b_image": [],
+        "a_text": [], "b_text": [],
+        "captions": [],"urls": [],
     }
 
     print(f"Streaming evaluation shards from {args.tarfiles_dir}...")
@@ -172,8 +172,10 @@ def main():
             index_data["e_image"].append(outputs["e_image"].cpu())
             index_data["h_text"].append(outputs["h_text"].cpu())
             index_data["e_text"].append(outputs["e_text"].cpu())
-            index_data["a"].append(outputs["a"].cpu())
-            index_data["b"].append(outputs["b"].cpu())
+            index_data["a_image"].append(outputs["a_image"].cpu())
+            index_data["b_image"].append(outputs["b_image"].cpu())
+            index_data["a_text"].append(outputs["a_text"].cpu())
+            index_data["b_text"].append(outputs["b_text"].cpu())
             
             # Safely capture the extracted text and URLs from our custom collate output
             index_data["captions"].extend(batch["captions"])
@@ -182,11 +184,13 @@ def main():
     print("Consolidating multi-batch representations...")
     final_index = {
         "h_image": torch.cat(index_data["h_image"], dim=0),
-        "e_image": F.normalize(torch.cat(index_data["e_image"], dim=0), p=2, dim=-1),
+        "e_image": torch.cat(index_data["e_image"], dim=0),
         "h_text": torch.cat(index_data["h_text"], dim=0),
-        "e_text": F.normalize(torch.cat(index_data["e_text"], dim=0), p=2, dim=-1),
-        "a": torch.cat(index_data["a"], dim=0),
-        "b": torch.cat(index_data["b"], dim=0),
+        "e_text": torch.cat(index_data["e_text"], dim=0),
+        "a_image": torch.cat(index_data["a_image"], dim=0),
+        "b_image": torch.cat(index_data["b_image"], dim=0),
+        "a_text": torch.cat(index_data["a_text"], dim=0),
+        "b_text": torch.cat(index_data["b_text"], dim=0),
         "captions": index_data["captions"],
         "urls": index_data["urls"]
     }
