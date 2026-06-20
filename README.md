@@ -26,13 +26,27 @@ Because the volume of hyperbolic space grows exponentially rather than polynomia
 ---
 ## Highlights
 
-- **~6× Embedding Compression:** Reduced embedding storage requirements by approximately 6× compared to the CLIP baseline through hierarchical hyperbolic representations.
+- **~4× Embedding Compression:** Reduced embedding storage requirements by approximately 4× compared to the CLIP baseline through hierarchical hyperbolic representations.
 - **~1.5× Faster Retrieval:** Achieved faster retrieval latency while maintaining strong semantic search capabilities.
 - **Hierarchical Multimodal Retrieval:** Organizes image-text data into semantic hierarchies for interpretable exploration and retrieval.
 - **Multimodal Search:** Supports text-to-image, image-to-image, and hybrid image+text retrieval.
 - **Interactive Visualization:** Generates navigable semantic trees for large-scale image collections.
 
 ---
+
+## Performance
+
+Evaluation on MS-COCO retrieval.
+
+| Variant | i2t R@1 | i2t R@5 | i2t R@10 | t2i R@1 | t2i R@5 | t2i R@10 |
+|----------|----------|----------|-----------|----------|----------|-----------|
+| Meridian (64d) | 29.66 | 55.20 | 67.18 | 25.29 | 51.00 | 63.02 |
+
+Where:
+
+- **i2t** = Image → Text Retrieval
+- **t2i** = Text → Image Retrieval
+- Retained ∼70–78% I2T and ∼87–91% T2I recall (R@5/10) relative to the full-dim CLIP zero-shot baseline, with ∼1.6× retrieval speedup on a 1.7M-item index.
 
 ## Hierarchy Comparison
 
@@ -331,18 +345,14 @@ Meridian/
 |       ├── dataset_download.py # (use to download dataset with --dataset argument or use CLI)
 │       ├── transforms.py  # Image/text preprocessing
 │       └── evaluation.py  # Evaluation dataset loaders
-│   
-│       
-│       
-│       
+│         
 ├── scripts/                # Training and evaluation scripts
 │   ├── train.py           # Main training script
 │   ├── evaluate.py        # Evaluation script
-│   ├── visualize.py       # Visualization utilities
-│   └── download_models.py # Download pre-trained models  
-├── checkpoints/      
-|      ├── CLIP    # Vit-B/16 weights
-|      └── meridian_model/  # meridian final weights
+│   ├── visualize.py      # Visualization utilities
+│   ├── build_index.py    # Used for building the index
+│   └── download_models.py # Use it only for model modifications requiring CLIP; otherwise, the backend API downloads both Meridian and CLIP from Hugging Face.
+├── checkpoints/            
 |── assets/
 └── README.md
 ```
