@@ -12,7 +12,6 @@ checkpoints
 meridian/data/cc3m.tsv
 meridian/data/cc3m_smoke.tsv
 meridian/data/cc3m_smoke
-output
 app_cache
-meridian/data/cc3m_index.pt
-scripts/visualize_dummy.py
+logs
+
