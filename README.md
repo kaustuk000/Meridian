@@ -394,23 +394,6 @@ See `pyproject.toml` for the complete dependency list.
 
 ---
 
-## Development
-
-### Running Tests
-
-```bash
-pytest tests/ -v
-```
-
-### Code Style
-
-This project uses `black` for formatting and `ruff` for linting:
-
-```bash
-black meridian/
-ruff check meridian/
-```
-
 ### Contributing
 
 Contributions are welcome! Please:
