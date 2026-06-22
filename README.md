@@ -220,6 +220,7 @@ http://localhost:5173
 ### Run Backend API
 
 ```bash
+cd Meridian
 uvicorn api.app:app --reload --port 8000  
 ```
 
