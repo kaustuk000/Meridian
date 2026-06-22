@@ -496,4 +496,4 @@ For questions, bug reports, or feature requests:
 
 ---
 
-**Last Updated:** June 2024
+**Last Updated:** June 2026
