@@ -48,6 +48,12 @@ Where:
 - **t2i** = Text → Image Retrieval
 - Retained ∼70–78% I2T and ∼87–91% T2I recall (R@5/10) relative to the full-dim CLIP zero-shot baseline, with ∼1.6× retrieval speedup on a 1.7M-item index.
 
+## Model Weights
+
+| Variant | Embedding Dim | Training Steps | HuggingFace |
+|---------|--------------|-------|-------------|
+| Meridian-64  | 64 | 100k | [kaustuk000/meridian](https://huggingface.co/kaustuk000/meridian) |
+
 ## Hierarchy Comparison
 
 The examples below illustrate how Meridian learns cleaner semantic hierarchies than the frozen CLIP baseline by reducing cross-category mixing and improving semantic specialization when organizing concepts derived from text queries.
